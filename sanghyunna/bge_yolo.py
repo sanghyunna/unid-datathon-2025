@@ -1,5 +1,8 @@
 """Multimodal bbox regressor powered by DocLayout YOLO + BGE-M3."""
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 import os
 import json
 import math
@@ -29,6 +32,16 @@ except Exception:
     _HAS_TRANSFORMERS = False
 
 try:
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+    _HAS_PEFT = True
+except Exception:
+    LoraConfig = None
+    get_peft_model = None
+    prepare_model_for_kbit_training = None
+    _HAS_PEFT = False
+
+try:
     from doclayout_yolo import YOLOv10
 
     _HAS_DOCYOLO = True
@@ -55,18 +68,22 @@ except Exception:
 
 class CFG:
     IMG_SIZE: int = 512
-    EPOCHS: int = 20
+    EPOCHS: int = 17
     LEARNING_RATE: float = 1e-4
-    BATCH_SIZE: int = 16
+    BATCH_SIZE: int = 128
     SEED: int = 42
-    NUM_WORKERS: int = 14
+    NUM_WORKERS: int = 8
     TEXT_ENCODER: str = "BAAI/bge-m3"
     TEXT_MAX_LEN: int = 200
     TEXT_PROMPT: str = ("다음 질문에 답하기 위해서 참조해야할 테이블을 알려주세요. ")
     # TEXT_PROMPT: str = ("다음 질의는 한국어로 작성된 시각적 지시입니다. ")
     CROSS_ATTN_DIM: int = 768
-    CROSS_ATTN_LAYERS: int = 3
-    CROSS_ATTN_HEADS: int = 8
+    CROSS_ATTN_LAYERS: int = 1
+    CROSS_ATTN_HEADS: int = 4
+    LORA_R: int = 16
+    LORA_ALPHA: int = 32
+    LORA_DROPOUT: float = 0.05
+    LORA_TARGET_MODULES: Optional[List[str]] = None  # None = auto-detect
     VISION_ENCODER: str = "doclayout-yolo-small"
     VISION_WEIGHTS: Optional[str] = None
     VISION_REPO_ID: Optional[str] = "juliozhao/DocLayout-YOLO-DocStructBench"
@@ -74,9 +91,10 @@ class CFG:
     VISION_CACHE_DIR: Optional[str] = None
     VISION_FEATURE_LEVEL: int = -1
     FREEZE_TEXT: bool = False
-    FREEZE_VISION: bool = False
+    FREEZE_VISION: bool = True
     CKPT_PATH: str = "./outputs/ckpt/layout_regressor_test.pth"
-    RESUME_CKPT_PATH: str = "./outputs/ckpt/layout_regressor.pth"
+    RESUME_CKPT_PATH: str = "./sanghyunna/outputs/ckpt/_layout_regressor_test_ep3.0.pth"
+    # RESUME_CKPT_PATH: str = "./outputs/ckpt/layout_regressor.pth"
     EVAL_CSV: str = "./outputs/preds/eval_pred.csv"
     PRED_CSV: str = "./outputs/preds/test_pred.csv"
     SUBMISSION_ZIP: str = "./outputs/submission.zip"
@@ -578,20 +596,56 @@ class BGEM3TextEncoder(nn.Module):
         dim: int,
         dropout: float = 0.1,
         freeze: bool = False,
+        use_lora: bool = False,
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+        lora_target_modules: Optional[List[str]] = None,
     ):
         super().__init__()
         if not _HAS_TRANSFORMERS:
             raise ImportError("transformers is required for BGEM3TextEncoder")
         if AutoModel is None:
             raise ImportError("AutoModel is unavailable despite transformers import")
+        
         self.encoder = AutoModel.from_pretrained(model_name)
         hidden = getattr(self.encoder.config, "hidden_size", dim)
         self.proj = nn.Linear(hidden, dim)
         self.dropout = nn.Dropout(dropout)
+        self.model_name = model_name
+        self.use_lora = use_lora
+        
         if freeze:
             for p in self.encoder.parameters():
                 p.requires_grad = False
-        self.model_name = model_name
+        elif use_lora:
+            # Apply QLoRA when not frozen
+            if not _HAS_PEFT:
+                raise ImportError("peft is required for LoRA. Install with: pip install peft")
+            if LoraConfig is None or get_peft_model is None:
+                raise ImportError("peft components unavailable")
+            
+            # Freeze base model first
+            for p in self.encoder.parameters():
+                p.requires_grad = False
+            
+            # Configure LoRA
+            if lora_target_modules is None:
+                # Auto-detect target modules for BERT-like models
+                lora_target_modules = ["query", "key", "value"]
+            
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=lora_target_modules,
+                lora_dropout=lora_dropout,
+                bias="none",
+                task_type="FEATURE_EXTRACTION",
+            )
+            
+            self.encoder = get_peft_model(self.encoder, lora_config)
+            print(f"[LoRA] Applied to text encoder with r={lora_r}, alpha={lora_alpha}")
+            self.encoder.print_trainable_parameters()
 
     def forward(self, tokens: Dict[str, torch.Tensor]) -> torch.Tensor:
         outputs = self.encoder(**tokens)
@@ -670,9 +724,24 @@ class LayoutAwareRegressor(nn.Module):
         freeze_text: bool,
         freeze_vision: bool,
         vision_feature_level: int,
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+        lora_target_modules: Optional[List[str]] = None,
     ):
         super().__init__()
-        self.text = BGEM3TextEncoder(text_encoder_name, dim=cross_attn_dim, freeze=freeze_text)
+        # When freeze_text=False, apply LoRA
+        use_lora = not freeze_text
+        self.text = BGEM3TextEncoder(
+            text_encoder_name, 
+            dim=cross_attn_dim, 
+            freeze=freeze_text,
+            use_lora=use_lora,
+            lora_r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            lora_target_modules=lora_target_modules,
+        )
         self.vision = DocLayoutYOLOBackbone(
             vision_encoder_name,
             out_dim=cross_attn_dim,
@@ -854,7 +923,7 @@ def make_loader(
         "persistent_workers": num_workers > 0,
     }
     if num_workers > 0:
-        loader_kwargs["prefetch_factor"] = 8
+        loader_kwargs["prefetch_factor"] = 2
     dl = DataLoader(full_ds, **loader_kwargs)
     return full_ds, dl
 
@@ -872,6 +941,20 @@ def save_checkpoint(
     cross_dim = getattr(model, "dim", dim)
     cross_layers = getattr(model, "cross_attn_layers", getattr(model, "num_cross_attn", CFG.CROSS_ATTN_LAYERS))
     cross_heads = getattr(model, "cross_attn_heads", CFG.CROSS_ATTN_HEADS)
+    
+    # Save LoRA parameters from text encoder if available
+    lora_r = CFG.LORA_R
+    lora_alpha = CFG.LORA_ALPHA
+    lora_dropout = CFG.LORA_DROPOUT
+    lora_target_modules = CFG.LORA_TARGET_MODULES
+    if hasattr(model, "text") and hasattr(model.text, "use_lora") and model.text.use_lora:
+        if hasattr(model.text.encoder, "peft_config"):
+            peft_cfg = list(model.text.encoder.peft_config.values())[0]
+            lora_r = peft_cfg.r
+            lora_alpha = peft_cfg.lora_alpha
+            lora_dropout = peft_cfg.lora_dropout
+            lora_target_modules = peft_cfg.target_modules
+    
     torch.save(
         {
             "model_state": model.state_dict(),
@@ -893,6 +976,10 @@ def save_checkpoint(
             "vision_repo_id": getattr(model, "vision_repo_id", CFG.VISION_REPO_ID),
             "vision_filename": getattr(model, "vision_filename", CFG.VISION_FILENAME),
             "vision_cache_dir": getattr(model, "vision_cache_dir", CFG.VISION_CACHE_DIR),
+            "lora_r": lora_r,
+            "lora_alpha": lora_alpha,
+            "lora_dropout": lora_dropout,
+            "lora_target_modules": lora_target_modules,
         },
         ckpt_path,
     )
@@ -922,6 +1009,12 @@ def _load_model_from_ckpt(
     )
     freeze_text = bool(freeze_text)
     freeze_vision = bool(freeze_vision)
+    
+    lora_r = ckpt.get("lora_r", CFG.LORA_R)
+    lora_alpha = ckpt.get("lora_alpha", CFG.LORA_ALPHA)
+    lora_dropout = ckpt.get("lora_dropout", CFG.LORA_DROPOUT)
+    lora_target_modules = ckpt.get("lora_target_modules", CFG.LORA_TARGET_MODULES)
+    
     model = LayoutAwareRegressor(
         cross_attn_dim=cross_dim,
         text_encoder_name=text_name,
@@ -935,6 +1028,10 @@ def _load_model_from_ckpt(
         freeze_text=freeze_text,
         freeze_vision=freeze_vision,
         vision_feature_level=vision_level,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        lora_target_modules=lora_target_modules,
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     meta = {
@@ -1069,6 +1166,10 @@ def train_loop(args):
             freeze_text=args.freeze_text,
             freeze_vision=args.freeze_vision,
             vision_feature_level=args.vision_feature_level,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            lora_target_modules=args.lora_target_modules,
         ).to(device)
     train_pairs = resolve_dir_pairs(
         getattr(args, "train_json_dir", None),
@@ -1205,6 +1306,10 @@ def fit_pipeline(args):
             freeze_text=args.freeze_text,
             freeze_vision=args.freeze_vision,
             vision_feature_level=args.vision_feature_level,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            lora_target_modules=args.lora_target_modules,
         ).to(device)
     train_pairs = resolve_dir_pairs(
         getattr(args, "train_json_dir", None),
@@ -1407,6 +1512,10 @@ def get_args():
         p.add_argument("--vision_feature_level", type=int, default=CFG.VISION_FEATURE_LEVEL)
         p.add_argument("--freeze_text", action="store_true", default=CFG.FREEZE_TEXT)
         p.add_argument("--freeze_vision", action="store_true", default=CFG.FREEZE_VISION)
+        p.add_argument("--lora_r", type=int, default=CFG.LORA_R)
+        p.add_argument("--lora_alpha", type=int, default=CFG.LORA_ALPHA)
+        p.add_argument("--lora_dropout", type=float, default=CFG.LORA_DROPOUT)
+        p.add_argument("--lora_target_modules", type=str, nargs="*", default=CFG.LORA_TARGET_MODULES)
 
     p_train = sub.add_parser("train")
     add_common(p_train)
