@@ -22,7 +22,7 @@ from torch.utils.data import Dataset, DataLoader
 
 # torchvision 백본 사용 가능 여부 체크
 try:
-    from torchvision.models import resnet18, ResNet18_Weights
+    from torchvision.models import resnet50, ResNet50_Weights
     _BACKBONE_OK = True
 except Exception:
     _BACKBONE_OK = False
@@ -30,16 +30,17 @@ except Exception:
 class CFG:
     # Core
     IMG_SIZE: int = 512
-    EPOCHS: int = 5
+    EPOCHS: int = 3
     LEARNING_RATE: float = 1e-4
     BATCH_SIZE: int = 64
     SEED: int = 42
-    DIM: int = 256
+    DIM: int = 512
     NUM_WORKERS: int = 14
     NO_PRETRAIN: bool = False  # True → disable ImageNet weights
 
     # Paths (override by CLI if desired)
     CKPT_PATH: str = "./outputs/ckpt/cross_attn_vlm.pth"
+    RESUME_CKPT_PATH: str = "./outputs/ckpt/cross_attn_vlm_ep10.0.pth"
     EVAL_CSV: str = "./outputs/preds/eval_pred.csv"
     PRED_CSV: str = "./outputs/preds/test_pred.csv"
     SUBMISSION_ZIP: str = "./outputs/submission.zip"
@@ -510,11 +511,11 @@ class ImageEncoder(nn.Module):
         self.resize = None
         if _BACKBONE_OK:
             try:
-                weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
-                m = resnet18(weights=weights)
+                weights = ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
+                m = resnet50(weights=weights)
                 layers = list(m.children())[:-2]  # (B, 512, H/32, W/32)
                 self.backbone = nn.Sequential(*layers)
-                self.proj = nn.Conv2d(512, out_dim, 1)
+                self.proj = nn.Conv2d(2048, out_dim, 1)
                 from torchvision import transforms as T
                 self.resize = T.Compose([T.Resize((img_size, img_size)), T.ToTensor()])
             except Exception:
@@ -820,24 +821,55 @@ def evaluate_loss(model: nn.Module, loader: DataLoader, device: torch.device,
 
 def train_loop(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     train_pairs = resolve_dir_pairs(
         getattr(args, "train_json_dir", None),
         getattr(args, "train_jpg_dir", None),
         getattr(args, "train_root", None),
         "train",
     )
-    train_ds, train_dl, vocab = make_loader(
-        train_pairs,
-        vocab=None,
-        build_vocab=True,
-        batch_size=args.batch_size,
-        img_size=args.img_size,
-        num_workers=args.num_workers,
-        shuffle=True,
-    )
 
-    model = CrossAttnVLM(vocab_size=len(vocab.itos),
-                         dim=args.dim, pretrained_backbone=not args.no_pretrain, img_size=args.img_size).to(device)
+    # ============================================
+    # Resume 여부에 따라 model / vocab / loader 구성
+    # ============================================
+    resume_ckpt = getattr(args, "resume_ckpt", None)
+
+    if resume_ckpt:
+        # 기존 체크포인트에서 모델 + vocab + img_size 로드
+        model, vocab, used_img_size = _load_model_from_ckpt(resume_ckpt, device)
+        # 실제 dim은 모델의 텍스트 임베딩 차원에서 읽어온다
+        ckpt_dim = model.txt.emb.embedding_dim
+
+        # 기존 vocab을 그대로 사용 (build_vocab=False)
+        train_ds, train_dl, _ = make_loader(
+            train_pairs,
+            vocab=vocab,
+            build_vocab=False,
+            batch_size=args.batch_size,
+            img_size=used_img_size,
+            num_workers=args.num_workers,
+            shuffle=True,
+        )
+        print(f"[Resume] Loaded checkpoint from {resume_ckpt}")
+    else:
+        # 처음부터 학습
+        used_img_size = args.img_size
+        train_ds, train_dl, vocab = make_loader(
+            train_pairs,
+            vocab=None,
+            build_vocab=True,
+            batch_size=args.batch_size,
+            img_size=used_img_size,
+            num_workers=args.num_workers,
+            shuffle=True,
+        )
+        model = CrossAttnVLM(
+            vocab_size=len(vocab.itos),
+            dim=args.dim,
+            pretrained_backbone=not args.no_pretrain,
+            img_size=used_img_size,
+        ).to(device)
+        ckpt_dim = args.dim
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -847,10 +879,16 @@ def train_loop(args):
         total_samples = len(train_dl.dataset)  # type: ignore[arg-type]
     else:
         total_samples = len(train_dl) * args.batch_size
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         running = 0.0
-        batch_iter = tqdm(train_dl, desc=f"train epoch {epoch}/{args.epochs}", leave=False, dynamic_ncols=True)
+        batch_iter = tqdm(
+            train_dl,
+            desc=f"train epoch {epoch}/{args.epochs}",
+            leave=False,
+            dynamic_ncols=True,
+        )
         for imgs, ids, lens, targets, meta, stacked_targets in batch_iter:
             imgs = imgs.to(device, non_blocking=True)
             ids = ids.to(device, non_blocking=True)
@@ -859,6 +897,7 @@ def train_loop(args):
                 t = stacked_targets.to(device, non_blocking=True)
             else:
                 t = torch.stack([tar for tar in targets if tar is not None], dim=0).to(device)
+
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
                 pred = model(imgs, ids, lens)   # (B,4) normalized
@@ -867,11 +906,15 @@ def train_loop(args):
             scaler.step(optimizer)
             scaler.update()
             running += float(loss.item()) * imgs.size(0)
+
         scheduler.step()
         avg = running / total_samples
         print(f"[Epoch {epoch}/{args.epochs}] loss={avg:.4f}  lr={scheduler.get_last_lr()[0]:.6f}")
 
-    save_checkpoint(model, vocab, args.img_size, args.save_ckpt, args.dim, args.no_pretrain)
+    # used_img_size / ckpt_dim 사용해서 저장 (dim 메타가 실제 모델과 일치하도록)
+    save_checkpoint(model, vocab, used_img_size, args.save_ckpt, ckpt_dim, args.no_pretrain)
+
+
 
 def _load_model_from_ckpt(ckpt_path: str, device: torch.device):
     ckpt = torch.load(ckpt_path, map_location=device)
@@ -959,26 +1002,67 @@ def fit_pipeline(args):
         "test",
     )
 
-    # 여기서 dataset도 같이 받아둠
-    train_ds, train_dl, vocab = make_loader(
-        train_pairs,
-        vocab=None,
-        build_vocab=True,
-        batch_size=args.batch_size,
-        img_size=args.img_size,
-        num_workers=args.num_workers,
-        shuffle=True,
-    )
+    # ============================================
+    # Resume 여부에 따라 model / vocab / loader 구성
+    # ============================================
+    resume_ckpt = getattr(args, "resume_ckpt", None)
 
-    val_ds, val_dl, _ = make_loader(
-        val_pairs,
-        vocab=vocab,
-        build_vocab=False,
-        batch_size=args.batch_size,
-        img_size=args.img_size,
-        num_workers=args.num_workers,
-        shuffle=False,
-    )
+    if resume_ckpt:
+        # 기존 체크포인트에서 모델 + vocab + img_size 로드
+        model, vocab, used_img_size = _load_model_from_ckpt(resume_ckpt, device)
+        ckpt_dim = model.txt.emb.embedding_dim
+
+        # 기존 vocab을 그대로 사용
+        train_ds, train_dl, _ = make_loader(
+            train_pairs,
+            vocab=vocab,
+            build_vocab=False,
+            batch_size=args.batch_size,
+            img_size=used_img_size,
+            num_workers=args.num_workers,
+            shuffle=True,
+        )
+
+        val_ds, val_dl, _ = make_loader(
+            val_pairs,
+            vocab=vocab,
+            build_vocab=False,
+            batch_size=args.batch_size,
+            img_size=used_img_size,
+            num_workers=args.num_workers,
+            shuffle=False,
+        )
+        print(f"[Resume] Loaded checkpoint from {resume_ckpt}")
+    else:
+        # 처음부터 학습
+        used_img_size = args.img_size
+        train_ds, train_dl, vocab = make_loader(
+            train_pairs,
+            vocab=None,
+            build_vocab=True,
+            batch_size=args.batch_size,
+            img_size=used_img_size,
+            num_workers=args.num_workers,
+            shuffle=True,
+        )
+
+        val_ds, val_dl, _ = make_loader(
+            val_pairs,
+            vocab=vocab,
+            build_vocab=False,
+            batch_size=args.batch_size,
+            img_size=used_img_size,
+            num_workers=args.num_workers,
+            shuffle=False,
+        )
+
+        model = CrossAttnVLM(
+            vocab_size=len(vocab.itos),
+            dim=args.dim,
+            pretrained_backbone=not args.no_pretrain,
+            img_size=used_img_size,
+        ).to(device)
+        ckpt_dim = args.dim
 
     # NEW: 0.5/1.0 epoch 평가용 eval loader (shuffle=False)
     eval_loader_kwargs = {
@@ -994,15 +1078,13 @@ def fit_pipeline(args):
 
     val_eval_dl = DataLoader(val_ds, **eval_loader_kwargs)
 
-    model = CrossAttnVLM(vocab_size=len(vocab.itos),
-                         dim=args.dim,
-                         pretrained_backbone=not args.no_pretrain,
-                         img_size=args.img_size).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
 
-    best_loss = float('inf')
+    # ===== [수정됨] =====
+    # best_loss 대신 best_miou 사용 (mIoU는 높을수록 좋으므로 0.0에서 시작)
+    best_miou = 0.0
     best_epoch = 0
     patience_ctr = 0
 
@@ -1010,7 +1092,8 @@ def fit_pipeline(args):
     ckpt_base, ckpt_ext = os.path.splitext(args.save_ckpt)
 
     # NEW: mIoU eval + ckpt helper
-    def eval_and_ckpt(tag: str, train_iou: Optional[float] = None):
+    # val_miou 값을 반환하도록 수정
+    def eval_and_ckpt(tag: str, train_iou: Optional[float] = None) -> Optional[float]:
         val_miou = export_predictions(
             model,
             val_eval_dl,
@@ -1026,14 +1109,15 @@ def fit_pipeline(args):
                 print(f"[mIoU {tag}] val={val_miou:.4f}")
 
         ckpt_path = f"{ckpt_base}_{tag}{ckpt_ext}"
-        save_checkpoint(model, vocab, args.img_size, ckpt_path, args.dim, args.no_pretrain)
-
+        # used_img_size / ckpt_dim 사용
+        save_checkpoint(model, vocab, used_img_size, ckpt_path, ckpt_dim, args.no_pretrain)
+        return val_miou
+    # ===================
 
     if hasattr(train_dl, "dataset") and hasattr(train_dl.dataset, "__len__"):
         total_samples = len(train_dl.dataset)  # type: ignore[arg-type]
     else:
         total_samples = len(train_dl) * args.batch_size
-
 
     for epoch in range(1, args.epochs + 1):
         # 0.5 epoch 지점 콜백: cur_train_iou를 받아서 val mIoU와 함께 찍음
@@ -1052,30 +1136,43 @@ def fit_pipeline(args):
         )
         scheduler.step()
 
+        # val_loss는 참고용으로 계산 (Early Stopping 기준 아님)
         val_loss = evaluate_loss(model, val_dl, device, desc="val loss")
         print(f"[Epoch {epoch}/{args.epochs}] train={train_loss:.4f} val={val_loss:.4f}  lr={scheduler.get_last_lr()[0]:.6f}")
 
         # epoch 끝에서도 한 번 더 전체 val mIoU + ckpt
         full_tag = f"ep{epoch:.1f}"
-        eval_and_ckpt(full_tag, train_iou=train_iou)
+        val_miou = eval_and_ckpt(full_tag, train_iou=train_iou)
 
-        # 이하 early stopping 로직은 그대로 유지
-        if val_loss + args.early_stop_delta < best_loss:
-            best_loss = val_loss
+        # ===== [mIoU 기준 Early Stopping 로직] =====
+        if val_miou is not None and val_miou >= best_miou - args.early_stop_delta:
+            if val_miou > best_miou + args.early_stop_delta:
+                patience_ctr = 0
+                print(f"[Best mIoU] New best: {val_miou:.4f} (was {best_miou:.4f})")
+            else:
+                patience_ctr += 1
+
+            best_miou = val_miou
             best_epoch = epoch
-            patience_ctr = 0
-            save_checkpoint(model, vocab, args.img_size, args.save_ckpt, args.dim, args.no_pretrain)
+            # '같거나' '더 좋을' 때 항상 최신 모델(best)로 저장
+            save_checkpoint(model, vocab, used_img_size, args.save_ckpt, ckpt_dim, args.no_pretrain)
+
+        elif val_miou is None:
+            print("[Warn] val_miou is None, skipping early stopping check.")
+            patience_ctr += 1
+
         else:
             patience_ctr += 1
+            print(f"[EarlyStop] mIoU not improved ({val_miou:.4f} < {best_miou:.4f}). Patience: {patience_ctr}/{args.early_stop_patience}")
             if patience_ctr >= args.early_stop_patience:
                 print("[EarlyStop] patience exhausted; halting training")
                 break
+        # ===== [수정 끝] =====
 
+    # 최종 결과 출력
+    print(f"[Best] epoch={best_epoch} val_mIoU={best_miou:.4f}")
 
-
-    print(f"[Best] epoch={best_epoch} val_loss={best_loss:.4f}")
-
-    # ===== 이하 부분은 기존 로직 그대로 =====
+    # ===== 이하 부분은 기존 로직 그대로 (최종 저장된 best 모델로 평가/추론) =====
     model, best_vocab, best_img_size = _load_model_from_ckpt(args.save_ckpt, device)
 
     _, val_eval_dl, _ = make_loader(
@@ -1103,7 +1200,6 @@ def fit_pipeline(args):
     export_predictions(model, test_dl, args.pred_csv, device, compute_iou=False, progress_desc="test preds")
 
 
-
 def get_args():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1127,6 +1223,9 @@ def get_args():
                          help="Explicit training JSON directory (use with --train_jpg_dir)")
     p_train.add_argument("--train_jpg_dir", type=str, default=CFG.TRAIN_JPG_DIR,
                          help="Explicit training JPG directory (use with --train_json_dir)")
+    # NEW: resume checkpoint
+    p_train.add_argument("--resume_ckpt", type=str, default=None,
+                         help="Path to checkpoint to resume training from")
 
     # eval
     p_eval = sub.add_parser("eval")
@@ -1172,6 +1271,9 @@ def get_args():
     p_fit.add_argument("--test_root", type=str, default=CFG.TEST_ROOT)
     p_fit.add_argument("--test_json_dir", type=str, default=CFG.TEST_JSON_DIR)
     p_fit.add_argument("--test_jpg_dir", type=str, default=CFG.TEST_JPG_DIR)
+    # NEW: resume checkpoint
+    p_fit.add_argument("--resume_ckpt", type=str, default=CFG.RESUME_CKPT_PATH,
+                       help="Path to checkpoint to resume training from")
 
     # submission (zip any csv)
     p_zip = sub.add_parser("zip")
@@ -1179,6 +1281,7 @@ def get_args():
     p_zip.add_argument("--out_zip", type=str, default=CFG.SUBMISSION_ZIP)
 
     return ap.parse_args()
+
 
 
 def main():
