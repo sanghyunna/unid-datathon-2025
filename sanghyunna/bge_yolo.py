@@ -70,7 +70,11 @@ class CFG:
     IMG_SIZE: int = 512
     EPOCHS: int = 20
     LEARNING_RATE: float = 1e-4
+<<<<<<< HEAD
     BATCH_SIZE: int = 128
+=======
+    BATCH_SIZE: int = 64
+>>>>>>> a942283 (bge_yolo 파라미터 튜닝)
     SEED: int = 42
     NUM_WORKERS: int = 2
     TEXT_ENCODER: str = "BAAI/bge-m3"
