@@ -1,0 +1,15 @@
+# 한 줄에 하나씩, 무시할 JSON 경로
+# 주석/빈 줄은 무시됨
+
+../data/train_valid/train/press_json/MI3_240725_TY2_0271_2.json../data/train_valid/train/press_json/MI3_240729_TY2_0071_2.json
+../data/train_valid/train/press_json/MI3_240729_TY2_0223_7.json
+../data/train_valid/train/press_json/MI3_240729_TY2_0344_3.json
+../data/train_valid/train/press_json/MI3_240729_TY2_0472_3.json
+../data/train_valid/train/press_json/MI3_240729_TY2_0596_2.json
+../data/train_valid/train/press_json/MI3_240730_TY2_0188_3.json
+../data/train_valid/train/press_json/MI3_240731_TY2_0331_1.json
+../data/train_valid/train/press_json/MI3_240731_TY2_0469_2.json
+../data/train_valid/train/press_json/MI3_240805_TY2_0440_4.json
+../data/train_valid/valid/press_json/MI3_240725_TY2_0057_1.json
+../data/train_valid/train/press_json/MI3_240725_TY2_0271_2.json
+../data/train_valid/train/press_json/MI3_240729_TY2_0071_2.json
