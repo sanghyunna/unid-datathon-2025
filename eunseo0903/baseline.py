@@ -22,7 +22,7 @@ from torch.utils.data import Dataset, DataLoader
 
 # torchvision 백본 사용 가능 여부 체크
 try:
-    from torchvision.models import resnet50, ResNet50_Weights
+    from torchvision.models import resnet18, ResNet18_Weights
     _BACKBONE_OK = True
 except Exception:
     _BACKBONE_OK = False
@@ -30,17 +30,16 @@ except Exception:
 class CFG:
     # Core
     IMG_SIZE: int = 512
-    EPOCHS: int = 3
+    EPOCHS: int = 5
     LEARNING_RATE: float = 1e-4
     BATCH_SIZE: int = 64
     SEED: int = 42
-    DIM: int = 512
+    DIM: int = 256
     NUM_WORKERS: int = 2
     NO_PRETRAIN: bool = False  # True → disable ImageNet weights
 
     # Paths (override by CLI if desired)
     CKPT_PATH: str = "./outputs/ckpt/cross_attn_vlm.pth"
-    RESUME_CKPT_PATH: str = "./outputs/ckpt/cross_attn_vlm_ep10.0.pth"
     EVAL_CSV: str = "./outputs/preds/eval_pred.csv"
     PRED_CSV: str = "./outputs/preds/test_pred.csv"
     SUBMISSION_ZIP: str = "./outputs/submission.zip"
@@ -261,7 +260,12 @@ class Vocab:
     def __init__(self, min_freq: int = 1):
         self.min_freq = min_freq
         self.freq: Dict[str, int] = {}
-        self.itos: List[str] = ["<pad>", "<unk>"]
+        
+        # --- [★ 1. 핵심 수정: 특수 토큰을 초기 단어장에 추가] ---
+        # [DOC], [QUERY], [TYPE]을 <pad>, <unk>와 같이 고유 ID를 갖도록 추가합니다.
+        self.itos: List[str] = ["<pad>", "<unk>", "[DOC]", "[QUERY]", "[TYPE]"]
+        # --- [수정 완료] ---
+        
         self.stoi: Dict[str, int] = {tok: i for i, tok in enumerate(self.itos)}
 
     def build(self, texts: List[str]):
@@ -269,6 +273,7 @@ class Vocab:
             for tok in simple_tokenize(s):
                 self.freq[tok] = self.freq.get(tok, 0) + 1
         for tok, f in sorted(self.freq.items(), key=lambda x: (-x[1], x[0])):
+            # self.stoi에 이미 [DOC] 등이 있으므로, min_freq를 통과해도 중복 추가되지 않습니다.
             if f >= self.min_freq and tok not in self.stoi:
                 self.stoi[tok] = len(self.itos)
                 self.itos.append(tok)
@@ -277,6 +282,7 @@ class Vocab:
         toks = simple_tokenize(s)[:max_len]
         if not toks:
             return [1]  # ensure length>=1 with <unk>
+        # simple_tokenize는 "[DOC]"를 하나의 토큰으로 인식하므로 수정이 필요 없습니다.
         return [self.stoi.get(t, 1) for t in toks]
 
 
@@ -286,8 +292,6 @@ class UniDSet(Dataset):
                  supervised_only: bool = False):
         
         self.items: List[Dict[str, Any]] = []
-
-        # 이미지 리사이즈/감독 여부 및 캐시 파일 suffix 설정
         self.resize_to = resize_to
         self.supervised_only = supervised_only
         self.cache_suffix = f"_cache_{resize_to[0]}x{resize_to[1]}.pt"
@@ -297,20 +301,22 @@ class UniDSet(Dataset):
         )
 
         for jf in tqdm(json_files, desc=f"[data] {desc_name}", leave=False, dynamic_ncols=True):
-            # 0) 화이트리스트에 있는 JSON은 스킵
             jf_norm = os.path.normpath(jf)
-            if jf_norm in BAD_JSON_WHITELIST: # (BAD_JSON_WHITELIST는 어딘가에 정의되어 있어야 함)
+            if jf_norm in BAD_JSON_WHITELIST:
                 print(f"[bad-json] skipping whitelisted JSON: {jf}")
                 continue
 
-            # 1) JSON 읽기
             try:
                 data = read_json(jf)
             except ValueError as err:
-                # (handle_bad_json_exception는 어딘가에 정의되어 있어야 함)
                 if handle_bad_json_exception(jf, err):
                     continue
                 raise
+
+            # --- [★ 2. 핵심 수정: doc_type 추출] ---
+            # JSON 최상단의 doc_type 정보를 가져옵니다. (없으면 빈 문자열)
+            doc_type = data.get("raw_data_info", {}).get("doc_type", "") or ""
+            # --- [수정 완료] ---
 
             ann = data.get("learning_data_info", {}).get("annotation", [])
             img_path = get_image_path(jf, data, jpg_dir=jpg_dir)
@@ -321,18 +327,28 @@ class UniDSet(Dataset):
 
                 qid = a.get("instance_id", "")
                 
-                # --- [★ 1. 핵심 수정: 텍스트 합치기] ---
+                # --- [★ 3. 핵심 수정: 구조화된 쿼리 문자열 생성] ---
                 qtxt = str(a.get("visual_instruction", "")).strip()
                 cname = a.get("class_name", "") or ""
-                combined_query = f"{cname} {qtxt}".strip()
+
+                # [DOC] {doc_type} [QUERY] {query_text} [TYPE] {class_name} 형식으로 조합
+                parts = []
+                if doc_type:
+                    parts.append(f"[DOC] {doc_type.strip()}") # 혹시 모를 공백 제거
+                if qtxt:
+                    parts.append(f"[QUERY] {qtxt}")
+                if cname:
+                    parts.append(f"[TYPE] {cname.strip()}") # 혹시 모를 공백 제거
+                
+                # 정보가 하나라도 있을 때만 공백으로 join
+                combined_query = " ".join(parts)
                 # --- [수정 완료] ---
 
-                bbox = a.get("bounding_box", None)  # train/val에는 bbox, test는 없을 수 있음
+                bbox = a.get("bounding_box", None) 
 
                 if supervised_only and not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
                     continue
 
-                # 캐시 파일 경로: 원본 이미지와 동일 경로, 다른 확장자(.pt)
                 base, _ = os.path.splitext(img_path)
                 cache_path = base + self.cache_suffix
 
@@ -340,37 +356,35 @@ class UniDSet(Dataset):
                     "json": jf,
                     "img": img_path,
                     "query_id": qid,
-                    "query": combined_query,  # <-- 수정: 합쳐진 쿼리를 저장
+                    "query": combined_query,  # <-- 수정: 구조화된 쿼리를 저장
                     "bbox": bbox,
-                    "class_name": cname,      # <-- 원본 class_name도 메타데이터로 저장
+                    "class_name": cname,
                     "cache_path": cache_path,
                 })
 
-        # --- [★ 2. 핵심 수정: 논리적 순서 변경] ---
-        # self.items 리스트가 모두 채워진 *후에* vocab을 빌드해야 합니다.
+        # Vocab 빌드 로직은 수정할 필요 없습니다.
+        # self.items가 채워진 후에 build가 호출되며,
+        # self.items의 "query" 키에는 이미 구조화된 문자열이 들어있습니다.
         self.vocab = vocab if vocab is not None else Vocab(min_freq=1)
         if build_vocab:
-            # "query" 키에는 이미 합쳐진 텍스트가 들어있습니다.
             self.vocab.build([it["query"] for it in self.items])
-        # --- [수정 완료] ---
 
-        # 모든 아이템에 대해 pre-encoding 수행
+        # Pre-encoding 로직도 수정할 필요 없습니다.
         for it in self.items:
-            # it["query"]는 이미 합쳐진 텍스트이므로, 이 부분은 수정할 필요가 없습니다.
             it["encoded_query"] = self.vocab.encode(it["query"], max_len=40)
 
         if _BACKBONE_OK:
             from torchvision import transforms as T
             self.tf = T.Compose([T.Resize(resize_to), T.ToTensor()])
         else:
-            self.tf = None  # will manually convert
+            self.tf = None
 
+    # ... __len__ 및 __getitem__ 등 나머지 코드는 수정 불필요 ...
     def __len__(self):
         return len(self.items)
 
     @staticmethod
     def _pil_to_tensor(img: Image.Image) -> torch.Tensor:
-        # (중복된 함수 정의 제거)
         arr = np.array(img).astype(np.float32) / 255.0
         if arr.ndim == 2:
             arr = np.stack([arr, arr, arr], axis=-1)
@@ -378,25 +392,17 @@ class UniDSet(Dataset):
         return torch.from_numpy(arr)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        # --- [수정 불필요] ---
-        # 이 함수는 __init__에서 준비한 it["encoded_query"]와 it["query"]를
-        # 그대로 사용하므로, 수정할 필요가 전혀 없습니다.
-        # --- [수정 불필요] ---
+        # 이 함수는 __init__에서 미리 인코딩한 it["encoded_query"]를 사용하므로
+        # 전혀 수정할 필요가 없습니다.
         it = self.items[idx]
         cache_path = it.get("cache_path", None)
-
-        # =========================
-        # 1) 캐시에서 먼저 시도
-        # =========================
         img_t: Optional[torch.Tensor] = None
         W: int
         H: int
 
         if cache_path is not None and os.path.isfile(cache_path):
             try:
-                # NOTE: PyTorch 2.6 대비 weights_only=False 명시
                 cached = torch.load(cache_path, map_location="cpu", weights_only=False)
-                # {"image": Tensor, "orig_size": (W, H)} 포맷을 기대
                 if isinstance(cached, dict) and "image" in cached and "orig_size" in cached:
                     img_t = cached["image"]
                     W, H = cached["orig_size"]
@@ -406,31 +412,24 @@ class UniDSet(Dataset):
                 print(f"[cache] failed to load {cache_path}: {e}")
                 img_t = None
 
-        # ==========================================
-        # 2) 캐시가 없거나 실패하면 원본에서 생성
-        # ==========================================
         if img_t is None:
             img = Image.open(it["img"]).convert("RGB")
             W, H = img.size
 
             if self.tf is not None:
-                img_t = self.tf(img)  # Resize + ToTensor
+                img_t = self.tf(img)
             else:
                 img = img.resize(self.resize_to, Image.BILNEAR)
                 img_t = self._pil_to_tensor(img)
 
-            # 생성한 결과를 캐시에 저장
             if cache_path is not None and not os.path.exists(cache_path):
                 try:
                     torch.save({"image": img_t, "orig_size": (W, H)}, cache_path)
                 except Exception as e:
                     print(f"[cache] failed to save {cache_path}: {e}")
-
-        # =========================
-        # 3) 나머지 메타/타깃 구성
-        # =========================
+        
         ids = it["encoded_query"]
-        length = max(1, len(ids))  # safety: ensure >=1
+        length = max(1, len(ids))
 
         sample: Dict[str, Any] = {
             "image": img_t,
@@ -441,8 +440,7 @@ class UniDSet(Dataset):
             "orig_size": (W, H),
             "class_name": it["class_name"],
         }
-
-        # JSON bbox (x, y, w, h) in pixel → (cx, cy, w, h) normalized
+        
         if it["bbox"] is not None and isinstance(it["bbox"], (list, tuple)) and len(it["bbox"]) == 4:
             x, y, w, h = it["bbox"]
             cx = (x + w / 2.0) / W
@@ -518,11 +516,11 @@ class ImageEncoder(nn.Module):
         self.resize = None
         if _BACKBONE_OK:
             try:
-                weights = ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
-                m = resnet50(weights=weights)
+                weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+                m = resnet18(weights=weights)
                 layers = list(m.children())[:-2]  # (B, 512, H/32, W/32)
                 self.backbone = nn.Sequential(*layers)
-                self.proj = nn.Conv2d(2048, out_dim, 1)
+                self.proj = nn.Conv2d(init, out_dim, 1)
                 from torchvision import transforms as T
                 self.resize = T.Compose([T.Resize((img_size, img_size)), T.ToTensor()])
             except Exception:
@@ -828,55 +826,24 @@ def evaluate_loss(model: nn.Module, loader: DataLoader, device: torch.device,
 
 def train_loop(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     train_pairs = resolve_dir_pairs(
         getattr(args, "train_json_dir", None),
         getattr(args, "train_jpg_dir", None),
         getattr(args, "train_root", None),
         "train",
     )
+    train_ds, train_dl, vocab = make_loader(
+        train_pairs,
+        vocab=None,
+        build_vocab=True,
+        batch_size=args.batch_size,
+        img_size=args.img_size,
+        num_workers=args.num_workers,
+        shuffle=True,
+    )
 
-    # ============================================
-    # Resume 여부에 따라 model / vocab / loader 구성
-    # ============================================
-    resume_ckpt = getattr(args, "resume_ckpt", None)
-
-    if resume_ckpt:
-        # 기존 체크포인트에서 모델 + vocab + img_size 로드
-        model, vocab, used_img_size = _load_model_from_ckpt(resume_ckpt, device)
-        # 실제 dim은 모델의 텍스트 임베딩 차원에서 읽어온다
-        ckpt_dim = model.txt.emb.embedding_dim
-
-        # 기존 vocab을 그대로 사용 (build_vocab=False)
-        train_ds, train_dl, _ = make_loader(
-            train_pairs,
-            vocab=vocab,
-            build_vocab=False,
-            batch_size=args.batch_size,
-            img_size=used_img_size,
-            num_workers=args.num_workers,
-            shuffle=True,
-        )
-        print(f"[Resume] Loaded checkpoint from {resume_ckpt}")
-    else:
-        # 처음부터 학습
-        used_img_size = args.img_size
-        train_ds, train_dl, vocab = make_loader(
-            train_pairs,
-            vocab=None,
-            build_vocab=True,
-            batch_size=args.batch_size,
-            img_size=used_img_size,
-            num_workers=args.num_workers,
-            shuffle=True,
-        )
-        model = CrossAttnVLM(
-            vocab_size=len(vocab.itos),
-            dim=args.dim,
-            pretrained_backbone=not args.no_pretrain,
-            img_size=used_img_size,
-        ).to(device)
-        ckpt_dim = args.dim
+    model = CrossAttnVLM(vocab_size=len(vocab.itos),
+                         dim=args.dim, pretrained_backbone=not args.no_pretrain, img_size=args.img_size).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -886,16 +853,10 @@ def train_loop(args):
         total_samples = len(train_dl.dataset)  # type: ignore[arg-type]
     else:
         total_samples = len(train_dl) * args.batch_size
-
     for epoch in range(1, args.epochs + 1):
         model.train()
         running = 0.0
-        batch_iter = tqdm(
-            train_dl,
-            desc=f"train epoch {epoch}/{args.epochs}",
-            leave=False,
-            dynamic_ncols=True,
-        )
+        batch_iter = tqdm(train_dl, desc=f"train epoch {epoch}/{args.epochs}", leave=False, dynamic_ncols=True)
         for imgs, ids, lens, targets, meta, stacked_targets in batch_iter:
             imgs = imgs.to(device, non_blocking=True)
             ids = ids.to(device, non_blocking=True)
@@ -904,7 +865,6 @@ def train_loop(args):
                 t = stacked_targets.to(device, non_blocking=True)
             else:
                 t = torch.stack([tar for tar in targets if tar is not None], dim=0).to(device)
-
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
                 pred = model(imgs, ids, lens)   # (B,4) normalized
@@ -913,15 +873,11 @@ def train_loop(args):
             scaler.step(optimizer)
             scaler.update()
             running += float(loss.item()) * imgs.size(0)
-
         scheduler.step()
         avg = running / total_samples
         print(f"[Epoch {epoch}/{args.epochs}] loss={avg:.4f}  lr={scheduler.get_last_lr()[0]:.6f}")
 
-    # used_img_size / ckpt_dim 사용해서 저장 (dim 메타가 실제 모델과 일치하도록)
-    save_checkpoint(model, vocab, used_img_size, args.save_ckpt, ckpt_dim, args.no_pretrain)
-
-
+    save_checkpoint(model, vocab, args.img_size, args.save_ckpt, args.dim, args.no_pretrain)
 
 def _load_model_from_ckpt(ckpt_path: str, device: torch.device):
     ckpt = torch.load(ckpt_path, map_location=device)
@@ -1009,67 +965,26 @@ def fit_pipeline(args):
         "test",
     )
 
-    # ============================================
-    # Resume 여부에 따라 model / vocab / loader 구성
-    # ============================================
-    resume_ckpt = getattr(args, "resume_ckpt", None)
+    # 여기서 dataset도 같이 받아둠
+    train_ds, train_dl, vocab = make_loader(
+        train_pairs,
+        vocab=None,
+        build_vocab=True,
+        batch_size=args.batch_size,
+        img_size=args.img_size,
+        num_workers=args.num_workers,
+        shuffle=True,
+    )
 
-    if resume_ckpt:
-        # 기존 체크포인트에서 모델 + vocab + img_size 로드
-        model, vocab, used_img_size = _load_model_from_ckpt(resume_ckpt, device)
-        ckpt_dim = model.txt.emb.embedding_dim
-
-        # 기존 vocab을 그대로 사용
-        train_ds, train_dl, _ = make_loader(
-            train_pairs,
-            vocab=vocab,
-            build_vocab=False,
-            batch_size=args.batch_size,
-            img_size=used_img_size,
-            num_workers=args.num_workers,
-            shuffle=True,
-        )
-
-        val_ds, val_dl, _ = make_loader(
-            val_pairs,
-            vocab=vocab,
-            build_vocab=False,
-            batch_size=args.batch_size,
-            img_size=used_img_size,
-            num_workers=args.num_workers,
-            shuffle=False,
-        )
-        print(f"[Resume] Loaded checkpoint from {resume_ckpt}")
-    else:
-        # 처음부터 학습
-        used_img_size = args.img_size
-        train_ds, train_dl, vocab = make_loader(
-            train_pairs,
-            vocab=None,
-            build_vocab=True,
-            batch_size=args.batch_size,
-            img_size=used_img_size,
-            num_workers=args.num_workers,
-            shuffle=True,
-        )
-
-        val_ds, val_dl, _ = make_loader(
-            val_pairs,
-            vocab=vocab,
-            build_vocab=False,
-            batch_size=args.batch_size,
-            img_size=used_img_size,
-            num_workers=args.num_workers,
-            shuffle=False,
-        )
-
-        model = CrossAttnVLM(
-            vocab_size=len(vocab.itos),
-            dim=args.dim,
-            pretrained_backbone=not args.no_pretrain,
-            img_size=used_img_size,
-        ).to(device)
-        ckpt_dim = args.dim
+    val_ds, val_dl, _ = make_loader(
+        val_pairs,
+        vocab=vocab,
+        build_vocab=False,
+        batch_size=args.batch_size,
+        img_size=args.img_size,
+        num_workers=args.num_workers,
+        shuffle=False,
+    )
 
     # NEW: 0.5/1.0 epoch 평가용 eval loader (shuffle=False)
     eval_loader_kwargs = {
@@ -1085,13 +1000,15 @@ def fit_pipeline(args):
 
     val_eval_dl = DataLoader(val_ds, **eval_loader_kwargs)
 
+    model = CrossAttnVLM(vocab_size=len(vocab.itos),
+                         dim=args.dim,
+                         pretrained_backbone=not args.no_pretrain,
+                         img_size=args.img_size).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
 
-    # ===== [수정됨] =====
-    # best_loss 대신 best_miou 사용 (mIoU는 높을수록 좋으므로 0.0에서 시작)
-    best_miou = 0.0
+    best_loss = float('inf')
     best_epoch = 0
     patience_ctr = 0
 
@@ -1099,8 +1016,7 @@ def fit_pipeline(args):
     ckpt_base, ckpt_ext = os.path.splitext(args.save_ckpt)
 
     # NEW: mIoU eval + ckpt helper
-    # val_miou 값을 반환하도록 수정
-    def eval_and_ckpt(tag: str, train_iou: Optional[float] = None) -> Optional[float]:
+    def eval_and_ckpt(tag: str, train_iou: Optional[float] = None):
         val_miou = export_predictions(
             model,
             val_eval_dl,
@@ -1116,15 +1032,14 @@ def fit_pipeline(args):
                 print(f"[mIoU {tag}] val={val_miou:.4f}")
 
         ckpt_path = f"{ckpt_base}_{tag}{ckpt_ext}"
-        # used_img_size / ckpt_dim 사용
-        save_checkpoint(model, vocab, used_img_size, ckpt_path, ckpt_dim, args.no_pretrain)
-        return val_miou
-    # ===================
+        save_checkpoint(model, vocab, args.img_size, ckpt_path, args.dim, args.no_pretrain)
+
 
     if hasattr(train_dl, "dataset") and hasattr(train_dl.dataset, "__len__"):
         total_samples = len(train_dl.dataset)  # type: ignore[arg-type]
     else:
         total_samples = len(train_dl) * args.batch_size
+
 
     for epoch in range(1, args.epochs + 1):
         # 0.5 epoch 지점 콜백: cur_train_iou를 받아서 val mIoU와 함께 찍음
@@ -1143,43 +1058,30 @@ def fit_pipeline(args):
         )
         scheduler.step()
 
-        # val_loss는 참고용으로 계산 (Early Stopping 기준 아님)
         val_loss = evaluate_loss(model, val_dl, device, desc="val loss")
         print(f"[Epoch {epoch}/{args.epochs}] train={train_loss:.4f} val={val_loss:.4f}  lr={scheduler.get_last_lr()[0]:.6f}")
 
         # epoch 끝에서도 한 번 더 전체 val mIoU + ckpt
         full_tag = f"ep{epoch:.1f}"
-        val_miou = eval_and_ckpt(full_tag, train_iou=train_iou)
+        eval_and_ckpt(full_tag, train_iou=train_iou)
 
-        # ===== [mIoU 기준 Early Stopping 로직] =====
-        if val_miou is not None and val_miou >= best_miou - args.early_stop_delta:
-            if val_miou > best_miou + args.early_stop_delta:
-                patience_ctr = 0
-                print(f"[Best mIoU] New best: {val_miou:.4f} (was {best_miou:.4f})")
-            else:
-                patience_ctr += 1
-
-            best_miou = val_miou
+        # 이하 early stopping 로직은 그대로 유지
+        if val_loss + args.early_stop_delta < best_loss:
+            best_loss = val_loss
             best_epoch = epoch
-            # '같거나' '더 좋을' 때 항상 최신 모델(best)로 저장
-            save_checkpoint(model, vocab, used_img_size, args.save_ckpt, ckpt_dim, args.no_pretrain)
-
-        elif val_miou is None:
-            print("[Warn] val_miou is None, skipping early stopping check.")
-            patience_ctr += 1
-
+            patience_ctr = 0
+            save_checkpoint(model, vocab, args.img_size, args.save_ckpt, args.dim, args.no_pretrain)
         else:
             patience_ctr += 1
-            print(f"[EarlyStop] mIoU not improved ({val_miou:.4f} < {best_miou:.4f}). Patience: {patience_ctr}/{args.early_stop_patience}")
             if patience_ctr >= args.early_stop_patience:
                 print("[EarlyStop] patience exhausted; halting training")
                 break
-        # ===== [수정 끝] =====
 
-    # 최종 결과 출력
-    print(f"[Best] epoch={best_epoch} val_mIoU={best_miou:.4f}")
 
-    # ===== 이하 부분은 기존 로직 그대로 (최종 저장된 best 모델로 평가/추론) =====
+
+    print(f"[Best] epoch={best_epoch} val_loss={best_loss:.4f}")
+
+    # ===== 이하 부분은 기존 로직 그대로 =====
     model, best_vocab, best_img_size = _load_model_from_ckpt(args.save_ckpt, device)
 
     _, val_eval_dl, _ = make_loader(
@@ -1207,6 +1109,7 @@ def fit_pipeline(args):
     export_predictions(model, test_dl, args.pred_csv, device, compute_iou=False, progress_desc="test preds")
 
 
+
 def get_args():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1230,9 +1133,6 @@ def get_args():
                          help="Explicit training JSON directory (use with --train_jpg_dir)")
     p_train.add_argument("--train_jpg_dir", type=str, default=CFG.TRAIN_JPG_DIR,
                          help="Explicit training JPG directory (use with --train_json_dir)")
-    # NEW: resume checkpoint
-    p_train.add_argument("--resume_ckpt", type=str, default=None,
-                         help="Path to checkpoint to resume training from")
 
     # eval
     p_eval = sub.add_parser("eval")
@@ -1278,9 +1178,6 @@ def get_args():
     p_fit.add_argument("--test_root", type=str, default=CFG.TEST_ROOT)
     p_fit.add_argument("--test_json_dir", type=str, default=CFG.TEST_JSON_DIR)
     p_fit.add_argument("--test_jpg_dir", type=str, default=CFG.TEST_JPG_DIR)
-    # NEW: resume checkpoint
-    p_fit.add_argument("--resume_ckpt", type=str, default=CFG.RESUME_CKPT_PATH,
-                       help="Path to checkpoint to resume training from")
 
     # submission (zip any csv)
     p_zip = sub.add_parser("zip")
@@ -1288,7 +1185,6 @@ def get_args():
     p_zip.add_argument("--out_zip", type=str, default=CFG.SUBMISSION_ZIP)
 
     return ap.parse_args()
-
 
 
 def main():
