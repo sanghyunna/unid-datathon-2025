@@ -34,20 +34,20 @@ class CFG:
     LEARNING_RATE: float = 1e-4
     BATCH_SIZE: int = 64
     SEED: int = 42
-    DIM: int = 512
+    DIM: int = 1024
     NUM_WORKERS: int = 8
     NO_PRETRAIN: bool = False  # True → disable ImageNet weights
-    CROSS_ATTN_DIM: Optional[int] = None  # fallback to DIM when not set
+    CROSS_ATTN_DIM: Optional[int] = 512  # fallback to DIM when not set
     CROSS_ATTN_LAYERS: int = 1
-    CROSS_ATTN_HEADS: int = 4
+    CROSS_ATTN_HEADS: int = 1
 
     # Paths (override by CLI if desired)
-    CKPT_PATH: str = "./outputs_baseline/ckpt/cross_attn_vlm.pth"
+    CKPT_PATH: str = "./outputs_baseline_best/ckpt/cross_attn_vlm.pth"
     RESUME_CKPT_PATH: str = None
-    # RESUME_CKPT_PATH: str = "./outputs_baseline/ckpt/cross_attn_vlm_ep10.0.pth"
-    EVAL_CSV: str = "./outputs_baseline/preds/eval_pred.csv"
-    PRED_CSV: str = "./outputs_baseline/preds/test_pred.csv"
-    SUBMISSION_ZIP: str = "./outputs_baseline/submission.zip"
+    # RESUME_CKPT_PATH: str = "./outputs_baseline_best/ckpt/cross_attn_vlm_ep10.0.pth"
+    EVAL_CSV: str = "./outputs_baseline_best/preds/eval_pred.csv"
+    PRED_CSV: str = "./outputs_baseline_best/preds/test_pred.csv"
+    SUBMISSION_ZIP: str = "./outputs_baseline_best/submission.zip"
 
     # Optional split-specific overrides
     TRAIN_ROOT: Optional[str] = "../data/train_valid/train"
@@ -59,6 +59,9 @@ class CFG:
     VAL_JPG_DIR: Optional[str] = None
     TEST_JSON_DIR: Optional[str] = None
     TEST_JPG_DIR: Optional[str] = None
+
+    USE_VAL_AS_TRAIN: bool = False  # True → also use validation split as training data
+
 
 BAD_JSON_WHITELIST_FILE = "./bad_json_whitelist.txt"
 
@@ -782,12 +785,26 @@ def make_loader(dir_pairs: List[Tuple[str, str]], vocab: Optional[Vocab] = None,
     return full_ds, dl, vocab
 
 
-def save_checkpoint(model: nn.Module, vocab: Vocab, img_size: int, ckpt_path: str, dim: int, no_pretrain: bool):
-    os.makedirs(os.path.dirname(ckpt_path) or '.', exist_ok=True)
+def save_checkpoint(
+    model: nn.Module,
+    vocab: Vocab,
+    img_size: int,
+    ckpt_path: str,
+    dim: int,
+    no_pretrain: bool,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
+    epoch: Optional[float] = None,
+    best_miou: Optional[float] = None,
+    patience_counter: Optional[int] = None,
+    best_epoch: Optional[int] = None,
+):
+    os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
     cross_dim = getattr(model, "cross_attn_dim", dim)
     cross_layers = getattr(model, "cross_attn_layers", getattr(model, "num_cross_attn", CFG.CROSS_ATTN_LAYERS))
     cross_heads = getattr(model, "cross_attn_heads", CFG.CROSS_ATTN_HEADS)
-    torch.save({
+    ckpt: Dict[str, Any] = {
         "model_state": model.state_dict(),
         "vocab_itos": vocab.itos,
         "dim": dim,
@@ -797,11 +814,24 @@ def save_checkpoint(model: nn.Module, vocab: Vocab, img_size: int, ckpt_path: st
         "num_cross_attn": cross_layers,
         "cross_attn_layers": cross_layers,
         "cross_attn_heads": cross_heads,
-    }, ckpt_path)
+    }
+    if optimizer is not None:
+        ckpt["optimizer_state"] = optimizer.state_dict()
+    if scheduler is not None:
+        ckpt["scheduler_state"] = scheduler.state_dict()
+    if scaler is not None:
+        ckpt["scaler_state"] = scaler.state_dict()
+    if epoch is not None:
+        ckpt["epoch"] = float(epoch)
+    if best_miou is not None:
+        ckpt["best_miou"] = float(best_miou)
+    if patience_counter is not None:
+        ckpt["patience_counter"] = int(patience_counter)
+    if best_epoch is not None:
+        ckpt["best_epoch"] = int(best_epoch)
+    torch.save(ckpt, ckpt_path)
     print(f"[Saved] {ckpt_path}")
 
-
-from typing import Tuple  # 이미 있으면 생략
 
 def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer,
                     scaler: torch.amp.GradScaler, device: torch.device,
@@ -853,32 +883,6 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim
 
 
 
-def evaluate_loss(model: nn.Module, loader: DataLoader, device: torch.device,
-                  desc: Optional[str] = None) -> float:
-    model.eval()
-    running = 0.0
-    total = 0
-    with torch.no_grad():
-        iterator = tqdm(loader, desc=desc or "eval", leave=False, dynamic_ncols=True)
-        for imgs, ids, lens, targets, meta, stacked_targets in iterator:
-            valid_idx = [i for i, tar in enumerate(targets) if tar is not None]
-            if not valid_idx:
-                continue
-            imgs = imgs.to(device, non_blocking=True)
-            ids = ids.to(device, non_blocking=True)
-            lens = lens.to(device, non_blocking=True)
-            pred = model(imgs, ids, lens)
-            pred_sel = pred[valid_idx]
-            if stacked_targets is not None:
-                tgt_sel = stacked_targets[valid_idx].to(device, non_blocking=True)
-            else:
-                tgt_sel = torch.stack([targets[i] for i in valid_idx], dim=0).to(device)
-            loss = F.smooth_l1_loss(pred_sel, tgt_sel, reduction="mean")
-            running += float(loss.item()) * len(valid_idx)
-            total += len(valid_idx)
-    return running / max(1, total)
-
-
 def train_loop(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -893,10 +897,11 @@ def train_loop(args):
     # Resume 여부에 따라 model / vocab / loader 구성
     # ============================================
     resume_ckpt = getattr(args, "resume_ckpt", None)
+    train_state: Dict[str, Any] = {}
 
     if resume_ckpt:
         # 기존 체크포인트에서 모델 + vocab + img_size 로드
-        model, vocab, used_img_size = _load_model_from_ckpt(resume_ckpt, device)
+        model, vocab, used_img_size, train_state = _load_model_from_ckpt(resume_ckpt, device)
         # 실제 dim은 모델의 텍스트 임베딩 차원에서 읽어온다
         ckpt_dim = model.txt.emb.embedding_dim
 
@@ -936,14 +941,22 @@ def train_loop(args):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
+    scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+    if train_state.get("optimizer_state"):
+        optimizer.load_state_dict(train_state["optimizer_state"])
+    if train_state.get("scheduler_state"):
+        scheduler.load_state_dict(train_state["scheduler_state"])
+    if train_state.get("scaler_state"):
+        scaler.load_state_dict(train_state["scaler_state"])
 
     if hasattr(train_dl, "dataset") and hasattr(train_dl.dataset, "__len__"):
         total_samples = len(train_dl.dataset)  # type: ignore[arg-type]
     else:
         total_samples = len(train_dl) * args.batch_size
 
-    for epoch in range(1, args.epochs + 1):
+    start_epoch = infer_start_epoch(train_state, 1)
+    last_epoch = start_epoch - 1
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         running = 0.0
         batch_iter = tqdm(
@@ -971,17 +984,31 @@ def train_loop(args):
             running += float(loss.item()) * imgs.size(0)
 
         scheduler.step()
+        last_epoch = epoch
         avg = running / total_samples
         print(f"[Epoch {epoch}/{args.epochs}] loss={avg:.4f}  lr={scheduler.get_last_lr()[0]:.6f}")
 
     # used_img_size / ckpt_dim 사용해서 저장 (dim 메타가 실제 모델과 일치하도록)
-    save_checkpoint(model, vocab, used_img_size, args.save_ckpt, ckpt_dim, args.no_pretrain)
+    save_checkpoint(
+        model,
+        vocab,
+        used_img_size,
+        args.save_ckpt,
+        ckpt_dim,
+        args.no_pretrain,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        epoch=last_epoch,
+    )
 
 
 
 def _load_model_from_ckpt(ckpt_path: str, device: torch.device):
     ckpt = torch.load(ckpt_path, map_location=device)
-    vocab = Vocab(); vocab.itos = ckpt["vocab_itos"]; vocab.stoi = {t: i for i, t in enumerate(vocab.itos)}
+    vocab = Vocab()
+    vocab.itos = ckpt["vocab_itos"]
+    vocab.stoi = {t: i for i, t in enumerate(vocab.itos)}
     cross_dim = ckpt.get("cross_attn_dim", ckpt.get("dim", CFG.DIM))
     cross_layers = ckpt.get("cross_attn_layers", ckpt.get("num_cross_attn", CFG.CROSS_ATTN_LAYERS))
     cross_heads = ckpt.get("cross_attn_heads", CFG.CROSS_ATTN_HEADS)
@@ -994,14 +1021,36 @@ def _load_model_from_ckpt(ckpt_path: str, device: torch.device):
         cross_attn_layers=cross_layers,
         cross_attn_heads=cross_heads,
     ).to(device)
-    model.load_state_dict(ckpt["model_state"]); model.eval()
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
     img_size = ckpt.get("img_size", CFG.IMG_SIZE)
-    return model, vocab, img_size
+    train_state = {
+        "optimizer_state": ckpt.get("optimizer_state"),
+        "scheduler_state": ckpt.get("scheduler_state"),
+        "scaler_state": ckpt.get("scaler_state"),
+        "epoch": ckpt.get("epoch"),
+        "best_miou": ckpt.get("best_miou"),
+        "patience_counter": ckpt.get("patience_counter"),
+        "best_epoch": ckpt.get("best_epoch"),
+    }
+    return model, vocab, img_size, train_state
+
+
+def infer_start_epoch(train_state: Optional[Dict[str, Any]], default_start: int = 1) -> int:
+    state = train_state or {}
+    marker = state.get("epoch")
+    if marker is None:
+        return default_start
+    try:
+        marker = float(marker)
+    except (TypeError, ValueError):
+        return default_start
+    return max(default_start, int(math.floor(marker)) + 1)
 
 
 def evaluate_loop(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, vocab, img_size = _load_model_from_ckpt(args.ckpt, device)
+    model, vocab, img_size, _ = _load_model_from_ckpt(args.ckpt, device)
 
     val_pairs = resolve_dir_pairs(
         getattr(args, "val_json_dir", None),
@@ -1025,7 +1074,7 @@ def evaluate_loop(args):
 
 def predict_loop(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, vocab, img_size = _load_model_from_ckpt(args.ckpt, device)
+    model, vocab, img_size, _ = _load_model_from_ckpt(args.ckpt, device)
 
     test_pairs = resolve_dir_pairs(
         getattr(args, "test_json_dir", None),
@@ -1074,19 +1123,27 @@ def fit_pipeline(args):
         "test",
     )
 
+    # Optionally treat validation split as part of training data
+    use_val_as_train = bool(getattr(args, "use_val_as_train", getattr(CFG, "USE_VAL_AS_TRAIN", False)))
+    if use_val_as_train:
+        combined_train_pairs = train_pairs + val_pairs
+    else:
+        combined_train_pairs = train_pairs
+
     # ============================================
     # Resume 여부에 따라 model / vocab / loader 구성
     # ============================================
     resume_ckpt = getattr(args, "resume_ckpt", None)
+    train_state: Dict[str, Any] = {}
 
     if resume_ckpt:
         # 기존 체크포인트에서 모델 + vocab + img_size 로드
-        model, vocab, used_img_size = _load_model_from_ckpt(resume_ckpt, device)
+        model, vocab, used_img_size, train_state = _load_model_from_ckpt(resume_ckpt, device)
         ckpt_dim = model.txt.emb.embedding_dim
 
         # 기존 vocab을 그대로 사용
         train_ds, train_dl, _ = make_loader(
-            train_pairs,
+            combined_train_pairs,
             vocab=vocab,
             build_vocab=False,
             batch_size=args.batch_size,
@@ -1109,7 +1166,7 @@ def fit_pipeline(args):
         # 처음부터 학습
         used_img_size = args.img_size
         train_ds, train_dl, vocab = make_loader(
-            train_pairs,
+            combined_train_pairs,
             vocab=None,
             build_vocab=True,
             batch_size=args.batch_size,
@@ -1155,20 +1212,26 @@ def fit_pipeline(args):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
+    scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+    if train_state.get("optimizer_state"):
+        optimizer.load_state_dict(train_state["optimizer_state"])
+    if train_state.get("scheduler_state"):
+        scheduler.load_state_dict(train_state["scheduler_state"])
+    if train_state.get("scaler_state"):
+        scaler.load_state_dict(train_state["scaler_state"])
 
     # ===== [수정됨] =====
     # best_loss 대신 best_miou 사용 (mIoU는 높을수록 좋으므로 0.0에서 시작)
-    best_miou = 0.0
-    best_epoch = 0
-    patience_ctr = 0
+    best_miou = float(train_state.get("best_miou") or 0.0)
+    best_epoch = int(train_state.get("best_epoch") or 0)
+    patience_ctr = int(train_state.get("patience_counter") or 0)
 
     # NEW: ckpt 이름 베이스
     ckpt_base, ckpt_ext = os.path.splitext(args.save_ckpt)
 
     # NEW: mIoU eval + ckpt helper
     # val_miou 값을 반환하도록 수정
-    def eval_and_ckpt(tag: str, train_iou: Optional[float] = None) -> Optional[float]:
+    def eval_and_ckpt(tag: str, train_iou: Optional[float] = None) -> Tuple[Optional[float], str]:
         val_miou = export_predictions(
             model,
             val_eval_dl,
@@ -1184,9 +1247,7 @@ def fit_pipeline(args):
                 print(f"[mIoU {tag}] val={val_miou:.4f}")
 
         ckpt_path = f"{ckpt_base}_{tag}{ckpt_ext}"
-        # used_img_size / ckpt_dim 사용
-        save_checkpoint(model, vocab, used_img_size, ckpt_path, ckpt_dim, args.no_pretrain)
-        return val_miou
+        return val_miou, ckpt_path
     # ===================
 
     if hasattr(train_dl, "dataset") and hasattr(train_dl.dataset, "__len__"):
@@ -1194,11 +1255,27 @@ def fit_pipeline(args):
     else:
         total_samples = len(train_dl) * args.batch_size
 
-    for epoch in range(1, args.epochs + 1):
+    start_epoch = infer_start_epoch(train_state, 1)
+    for epoch in range(start_epoch, args.epochs + 1):
         # 0.5 epoch 지점 콜백: cur_train_iou를 받아서 val mIoU와 함께 찍음
         def half_cb(cur_train_iou, ep=epoch):
             tag = f"ep{ep - 0.5:.1f}"
-            eval_and_ckpt(tag, train_iou=cur_train_iou)
+            _, ckpt_path = eval_and_ckpt(tag, train_iou=cur_train_iou)
+            save_checkpoint(
+                model,
+                vocab,
+                used_img_size,
+                ckpt_path,
+                ckpt_dim,
+                args.no_pretrain,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=ep - 0.5,
+                best_miou=best_miou,
+                patience_counter=patience_ctr,
+                best_epoch=best_epoch,
+            )
 
         train_loss, train_iou = train_one_epoch(
             model,
@@ -1210,27 +1287,43 @@ def fit_pipeline(args):
             on_half_epoch=half_cb,  # 여기서 half_cb에 train_iou 전달
         )
         scheduler.step()
-
-        # val_loss는 참고용으로 계산 (Early Stopping 기준 아님)
-        val_loss = evaluate_loss(model, val_dl, device, desc="val loss")
-        print(f"[Epoch {epoch}/{args.epochs}] train={train_loss:.4f} val={val_loss:.4f}  lr={scheduler.get_last_lr()[0]:.6f}")
+        print(
+            f"[Epoch {epoch}/{args.epochs}] train={train_loss:.4f} "
+            f"train_mIoU={train_iou:.4f}  lr={scheduler.get_last_lr()[0]:.6f}"
+        )
 
         # epoch 끝에서도 한 번 더 전체 val mIoU + ckpt
         full_tag = f"ep{epoch:.1f}"
-        val_miou = eval_and_ckpt(full_tag, train_iou=train_iou)
+        val_miou, tag_ckpt_path = eval_and_ckpt(full_tag, train_iou=train_iou)
 
         # ===== [mIoU 기준 Early Stopping 로직] =====
+        should_stop = False
         if val_miou is not None and val_miou >= best_miou - args.early_stop_delta:
             if val_miou > best_miou + args.early_stop_delta:
                 patience_ctr = 0
                 print(f"[Best mIoU] New best: {val_miou:.4f} (was {best_miou:.4f})")
+                best_miou = val_miou
+                best_epoch = epoch
             else:
                 patience_ctr += 1
 
-            best_miou = val_miou
-            best_epoch = epoch
+            best_miou = max(best_miou, val_miou)
             # '같거나' '더 좋을' 때 항상 최신 모델(best)로 저장
-            save_checkpoint(model, vocab, used_img_size, args.save_ckpt, ckpt_dim, args.no_pretrain)
+            save_checkpoint(
+                model,
+                vocab,
+                used_img_size,
+                args.save_ckpt,
+                ckpt_dim,
+                args.no_pretrain,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=epoch,
+                best_miou=best_miou,
+                patience_counter=patience_ctr,
+                best_epoch=best_epoch,
+            )
 
         elif val_miou is None:
             print("[Warn] val_miou is None, skipping early stopping check.")
@@ -1241,14 +1334,31 @@ def fit_pipeline(args):
             print(f"[EarlyStop] mIoU not improved ({val_miou:.4f} < {best_miou:.4f}). Patience: {patience_ctr}/{args.early_stop_patience}")
             if patience_ctr >= args.early_stop_patience:
                 print("[EarlyStop] patience exhausted; halting training")
-                break
+                should_stop = True
+        save_checkpoint(
+            model,
+            vocab,
+            used_img_size,
+            tag_ckpt_path,
+            ckpt_dim,
+            args.no_pretrain,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            epoch=epoch,
+            best_miou=best_miou,
+            patience_counter=patience_ctr,
+            best_epoch=best_epoch,
+        )
+        if should_stop:
+            break
         # ===== [수정 끝] =====
 
     # 최종 결과 출력
     print(f"[Best] epoch={best_epoch} val_mIoU={best_miou:.4f}")
 
     # ===== 이하 부분은 기존 로직 그대로 (최종 저장된 best 모델로 평가/추론) =====
-    model, best_vocab, best_img_size = _load_model_from_ckpt(args.save_ckpt, device)
+    model, best_vocab, best_img_size, _ = _load_model_from_ckpt(args.save_ckpt, device)
 
     _, val_eval_dl, _ = make_loader(
         val_pairs,
@@ -1355,6 +1465,13 @@ def get_args():
     # NEW: resume checkpoint
     p_fit.add_argument("--resume_ckpt", type=str, default=CFG.RESUME_CKPT_PATH,
                        help="Path to checkpoint to resume training from")
+    p_fit.add_argument(
+        "--use_val_as_train",
+        action="store_true",
+        default=CFG.USE_VAL_AS_TRAIN,
+        help="If set, include validation split data in the training set",
+    )
+
 
     # submission (zip any csv)
     p_zip = sub.add_parser("zip")

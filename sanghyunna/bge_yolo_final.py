@@ -68,16 +68,16 @@ except Exception:
 
 class CFG:
     IMG_SIZE: int = 512
-    EPOCHS: int = 20
+    EPOCHS: int = 17
     LEARNING_RATE: float = 1e-4
     BATCH_SIZE: int = 128
     SEED: int = 42
-    NUM_WORKERS: int = 2
+    NUM_WORKERS: int = 8
     TEXT_ENCODER: str = "BAAI/bge-m3"
     TEXT_MAX_LEN: int = 200
-    # TEXT_PROMPT: str = ("다음 질문에 답하기 위해서 참조해야할 테이블을 알려주세요. ")
-    TEXT_PROMPT: str = ("다음 질의는 한국어로 작성된 시각적 지시입니다. ")
-    CROSS_ATTN_DIM: int = 512
+    TEXT_PROMPT: str = ("다음 질문에 답하기 위해서 참조해야할 테이블을 알려주세요. ")
+    # TEXT_PROMPT: str = ("다음 질의는 한국어로 작성된 시각적 지시입니다. ")
+    CROSS_ATTN_DIM: int = 768
     CROSS_ATTN_LAYERS: int = 1
     CROSS_ATTN_HEADS: int = 4
     LORA_R: int = 16
@@ -90,7 +90,7 @@ class CFG:
     VISION_FILENAME: Optional[str] = "doclayout_yolo_docstructbench_imgsz1024.pt"
     VISION_CACHE_DIR: Optional[str] = None
     VISION_FEATURE_LEVEL: int = -1
-    FREEZE_TEXT: bool = True
+    FREEZE_TEXT: bool = False
     FREEZE_VISION: bool = True
     CKPT_PATH: str = "./outputs/ckpt/layout_regressor_test.pth"
     RESUME_CKPT_PATH: str = "./sanghyunna/outputs/ckpt/_layout_regressor_test_ep3.0.pth"
@@ -936,6 +936,12 @@ def save_checkpoint(
     dim: int,
     text_max_len: int,
     text_prompt: Optional[str],
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    scaler: Optional[GradScaler] = None,
+    epoch: Optional[float] = None,
+    best_miou: Optional[float] = None,
+    patience_counter: Optional[int] = None,
 ):
     os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
     cross_dim = getattr(model, "dim", dim)
@@ -955,34 +961,44 @@ def save_checkpoint(
             lora_dropout = peft_cfg.lora_dropout
             lora_target_modules = peft_cfg.target_modules
     
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "tokenizer_name": tokenizer_name,
-            "img_size": img_size,
-            "dim": cross_dim,
-            "cross_attn_dim": cross_dim,
-            "text_max_len": text_max_len,
-            "text_prompt": text_prompt,
-            "text_encoder_name": getattr(model, "text_name", CFG.TEXT_ENCODER),
-            "vision_encoder_name": getattr(model, "vision_name", CFG.VISION_ENCODER),
-            "num_cross_attn": cross_layers,
-            "cross_attn_layers": cross_layers,
-            "cross_attn_heads": cross_heads,
-            "freeze_text": getattr(model, "freeze_text", CFG.FREEZE_TEXT),
-            "freeze_vision": getattr(model, "freeze_vision", CFG.FREEZE_VISION),
-            "vision_feature_level": getattr(model, "vision_feature_level", CFG.VISION_FEATURE_LEVEL),
-            "vision_weights_path": getattr(model, "vision_weights_path", CFG.VISION_WEIGHTS),
-            "vision_repo_id": getattr(model, "vision_repo_id", CFG.VISION_REPO_ID),
-            "vision_filename": getattr(model, "vision_filename", CFG.VISION_FILENAME),
-            "vision_cache_dir": getattr(model, "vision_cache_dir", CFG.VISION_CACHE_DIR),
-            "lora_r": lora_r,
-            "lora_alpha": lora_alpha,
-            "lora_dropout": lora_dropout,
-            "lora_target_modules": lora_target_modules,
-        },
-        ckpt_path,
-    )
+    ckpt = {
+        "model_state": model.state_dict(),
+        "tokenizer_name": tokenizer_name,
+        "img_size": img_size,
+        "dim": cross_dim,
+        "cross_attn_dim": cross_dim,
+        "text_max_len": text_max_len,
+        "text_prompt": text_prompt,
+        "text_encoder_name": getattr(model, "text_name", CFG.TEXT_ENCODER),
+        "vision_encoder_name": getattr(model, "vision_name", CFG.VISION_ENCODER),
+        "num_cross_attn": cross_layers,
+        "cross_attn_layers": cross_layers,
+        "cross_attn_heads": cross_heads,
+        "freeze_text": getattr(model, "freeze_text", CFG.FREEZE_TEXT),
+        "freeze_vision": getattr(model, "freeze_vision", CFG.FREEZE_VISION),
+        "vision_feature_level": getattr(model, "vision_feature_level", CFG.VISION_FEATURE_LEVEL),
+        "vision_weights_path": getattr(model, "vision_weights_path", CFG.VISION_WEIGHTS),
+        "vision_repo_id": getattr(model, "vision_repo_id", CFG.VISION_REPO_ID),
+        "vision_filename": getattr(model, "vision_filename", CFG.VISION_FILENAME),
+        "vision_cache_dir": getattr(model, "vision_cache_dir", CFG.VISION_CACHE_DIR),
+        "lora_r": lora_r,
+        "lora_alpha": lora_alpha,
+        "lora_dropout": lora_dropout,
+        "lora_target_modules": lora_target_modules,
+    }
+    if optimizer is not None:
+        ckpt["optimizer_state"] = optimizer.state_dict()
+    if scheduler is not None:
+        ckpt["scheduler_state"] = scheduler.state_dict()
+    if scaler is not None:
+        ckpt["scaler_state"] = scaler.state_dict()
+    if epoch is not None:
+        ckpt["epoch"] = float(epoch)
+    if best_miou is not None:
+        ckpt["best_miou"] = float(best_miou)
+    if patience_counter is not None:
+        ckpt["patience_counter"] = int(patience_counter)
+    torch.save(ckpt, ckpt_path)
     print(f"[Saved] {ckpt_path}")
 
 
@@ -1054,7 +1070,27 @@ def _load_model_from_ckpt(
         "vision_filename": vision_filename,
         "vision_cache_dir": vision_cache_dir,
     }
-    return model, meta
+    train_state = {
+        "optimizer_state": ckpt.get("optimizer_state"),
+        "scheduler_state": ckpt.get("scheduler_state"),
+        "scaler_state": ckpt.get("scaler_state"),
+        "epoch": ckpt.get("epoch"),
+        "best_miou": ckpt.get("best_miou"),
+        "patience_counter": ckpt.get("patience_counter"),
+    }
+    return model, meta, train_state
+
+
+def infer_start_epoch(train_state: Optional[Dict[str, Any]], default_start: int = 1) -> int:
+    state = train_state or {}
+    marker = state.get("epoch")
+    if marker is None:
+        return default_start
+    try:
+        marker = float(marker)
+    except (TypeError, ValueError):
+        return default_start
+    return max(default_start, int(math.floor(marker)) + 1)
 
 
 def train_one_epoch(
@@ -1110,35 +1146,12 @@ def train_one_epoch(
     return avg_loss, avg_iou
 
 
-def evaluate_loss(model: nn.Module, loader: DataLoader, device: torch.device, desc: Optional[str] = None) -> float:
-    model.eval()
-    running = 0.0
-    total = 0
-    with torch.no_grad():
-        iterator = tqdm(loader, desc=desc or "eval", leave=False, dynamic_ncols=True)
-        for imgs, text_inputs, targets, _, stacked_targets in iterator:
-            valid_idx = [i for i, tar in enumerate(targets) if tar is not None]
-            if not valid_idx:
-                continue
-            imgs = imgs.to(device, non_blocking=True)
-            text_inputs = {k: v.to(device, non_blocking=True) for k, v in text_inputs.items()}
-            pred = model(imgs, text_inputs)
-            pred_sel = pred[valid_idx]
-            if stacked_targets is not None:
-                tgt_sel = stacked_targets[valid_idx].to(device, non_blocking=True)
-            else:
-                tgt_sel = torch.stack([targets[i] for i in valid_idx], dim=0).to(device, non_blocking=True)
-            loss = F.smooth_l1_loss(pred_sel, tgt_sel, reduction="mean")
-            running += float(loss.item()) * len(valid_idx)
-            total += len(valid_idx)
-    return running / max(1, total)
-
-
 def train_loop(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     resume_ckpt = getattr(args, "resume_ckpt", None)
+    train_state: Dict[str, Any] = {}
     if resume_ckpt:
-        model, meta = _load_model_from_ckpt(resume_ckpt, device)
+        model, meta, train_state = _load_model_from_ckpt(resume_ckpt, device)
         tokenizer_name = meta["tokenizer_name"]
         used_img_size = meta["img_size"]
         text_max_len = meta["text_max_len"]
@@ -1191,7 +1204,15 @@ def train_loop(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = GradScaler(enabled=torch.cuda.is_available())
-    for epoch in range(1, args.epochs + 1):
+    if train_state.get("optimizer_state"):
+        optimizer.load_state_dict(train_state["optimizer_state"])
+    if train_state.get("scheduler_state"):
+        scheduler.load_state_dict(train_state["scheduler_state"])
+    if train_state.get("scaler_state"):
+        scaler.load_state_dict(train_state["scaler_state"])
+    start_epoch = infer_start_epoch(train_state, 1)
+    last_epoch = start_epoch - 1
+    for epoch in range(start_epoch, args.epochs + 1):
         train_loss, train_iou = train_one_epoch(
             model,
             train_dl,
@@ -1201,6 +1222,7 @@ def train_loop(args):
             desc=f"train epoch {epoch}/{args.epochs}",
         )
         scheduler.step()
+        last_epoch = epoch
         avg = train_loss
         print(f"[Epoch {epoch}/{args.epochs}] loss={avg:.4f}  lr={scheduler.get_last_lr()[0]:.6f}  miou={train_iou:.4f}")
     save_checkpoint(
@@ -1211,12 +1233,16 @@ def train_loop(args):
         dim=model.dim,
         text_max_len=text_max_len,
         text_prompt=prompt_text,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        epoch=last_epoch,
     )
 
 
 def evaluate_loop(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, meta = _load_model_from_ckpt(args.ckpt, device)
+    model, meta, _ = _load_model_from_ckpt(args.ckpt, device)
     tokenizer = prepare_tokenizer(meta["tokenizer_name"])
     prompt_builder = build_prompt_builder(meta.get("text_prompt"))
     val_pairs = resolve_dir_pairs(
@@ -1243,7 +1269,7 @@ def evaluate_loop(args):
 
 def predict_loop(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, meta = _load_model_from_ckpt(args.ckpt, device)
+    model, meta, _ = _load_model_from_ckpt(args.ckpt, device)
     tokenizer = prepare_tokenizer(meta["tokenizer_name"])
     prompt_builder = build_prompt_builder(meta.get("text_prompt"))
     test_pairs = resolve_dir_pairs(
@@ -1277,8 +1303,9 @@ def zip_submission(csv_path: str, zip_path: str):
 def fit_pipeline(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     resume_ckpt = getattr(args, "resume_ckpt", None)
+    train_state: Dict[str, Any] = {}
     if resume_ckpt:
-        model, meta = _load_model_from_ckpt(resume_ckpt, device)
+        model, meta, train_state = _load_model_from_ckpt(resume_ckpt, device)
         tokenizer_name = meta["tokenizer_name"]
         used_img_size = meta["img_size"]
         text_max_len = meta["text_max_len"]
@@ -1365,12 +1392,19 @@ def fit_pipeline(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = GradScaler(enabled=torch.cuda.is_available())
-    best_miou = 0.0
-    patience_ctr = 0
+    if train_state.get("optimizer_state"):
+        optimizer.load_state_dict(train_state["optimizer_state"])
+    if train_state.get("scheduler_state"):
+        scheduler.load_state_dict(train_state["scheduler_state"])
+    if train_state.get("scaler_state"):
+        scaler.load_state_dict(train_state["scaler_state"])
+    best_miou = float(train_state.get("best_miou") or 0.0)
+    patience_ctr = int(train_state.get("patience_counter") or 0)
     ckpt_base, ckpt_ext = os.path.splitext(args.save_ckpt)
     pred_csv_base, pred_csv_ext = os.path.splitext(args.pred_csv)
+    start_epoch = infer_start_epoch(train_state, 1)
 
-    def eval_and_ckpt(tag: str, train_iou: Optional[float] = None) -> Optional[float]:
+    def eval_and_ckpt(tag: str, train_iou: Optional[float] = None) -> Tuple[Optional[float], str]:
         ckpt_path = f"{ckpt_base}_{tag}{ckpt_ext}"
         miou = export_predictions(
             model,
@@ -1385,21 +1419,26 @@ def fit_pipeline(args):
                 print(f"[mIoU {tag}] train={train_iou:.4f}  val={miou:.4f}")
             else:
                 print(f"[mIoU {tag}] val={miou:.4f}")
-        save_checkpoint(
-            model,
-            tokenizer_name,
-            used_img_size,
-            ckpt_path,
-            dim=model.dim,
-            text_max_len=text_max_len,
-            text_prompt=prompt_text,
-        )
-        return miou
-
-    for epoch in range(1, args.epochs + 1):
+        return miou, ckpt_path
+    for epoch in range(start_epoch, args.epochs + 1):
         def half_cb(cur_train_iou, ep=epoch):
             tag = f"ep{ep - 0.5:.1f}"
-            eval_and_ckpt(tag, train_iou=cur_train_iou)
+            _, ckpt_path = eval_and_ckpt(tag, train_iou=cur_train_iou)
+            save_checkpoint(
+                model,
+                tokenizer_name,
+                used_img_size,
+                ckpt_path,
+                dim=model.dim,
+                text_max_len=text_max_len,
+                text_prompt=prompt_text,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=ep - 0.5,
+                best_miou=best_miou,
+                patience_counter=patience_ctr,
+            )
 
         train_loss, train_iou = train_one_epoch(
             model,
@@ -1411,13 +1450,12 @@ def fit_pipeline(args):
             on_half_epoch=half_cb,
         )
         scheduler.step()
-        val_loss = evaluate_loss(model, val_dl, device, desc="val loss")
         print(
-            f"[Epoch {epoch}/{args.epochs}] train={train_loss:.4f} val={val_loss:.4f}  "
-            f"lr={scheduler.get_last_lr()[0]:.6f}"
+            f"[Epoch {epoch}/{args.epochs}] train={train_loss:.4f} "
+            f"train_mIoU={train_iou:.4f}  lr={scheduler.get_last_lr()[0]:.6f}"
         )
         full_tag = f"ep{epoch:.1f}"
-        val_miou = eval_and_ckpt(full_tag, train_iou=train_iou)
+        val_miou, tag_ckpt_path = eval_and_ckpt(full_tag, train_iou=train_iou)
         
         # Create test predictions after each epoch
         test_pred_csv = f"{pred_csv_base}_ep{epoch}{pred_csv_ext}"
@@ -1430,6 +1468,7 @@ def fit_pipeline(args):
             progress_desc=f"test preds ep{epoch}"
         )
         
+        should_stop = False
         if val_miou is not None and val_miou >= best_miou - args.early_stop_delta:
             if val_miou > best_miou + args.early_stop_delta:
                 patience_ctr = 0
@@ -1445,6 +1484,12 @@ def fit_pipeline(args):
                 dim=model.dim,
                 text_max_len=text_max_len,
                 text_prompt=prompt_text,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=epoch,
+                best_miou=best_miou,
+                patience_counter=patience_ctr,
             )
         elif val_miou is None:
             print("[Warn] val_miou is None, skipping early stopping check.")
@@ -1457,9 +1502,26 @@ def fit_pipeline(args):
             )
             if patience_ctr >= args.early_stop_patience:
                 print("[EarlyStop] patience exhausted; halting training")
-                break
+                should_stop = True
+        save_checkpoint(
+            model,
+            tokenizer_name,
+            used_img_size,
+            tag_ckpt_path,
+            dim=model.dim,
+            text_max_len=text_max_len,
+            text_prompt=prompt_text,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            epoch=epoch,
+            best_miou=best_miou,
+            patience_counter=patience_ctr,
+        )
+        if should_stop:
+            break
     print(f"[Best] val_mIoU={best_miou:.4f}")
-    model, meta = _load_model_from_ckpt(args.save_ckpt, device)
+    model, meta, _ = _load_model_from_ckpt(args.save_ckpt, device)
     tokenizer = prepare_tokenizer(meta["tokenizer_name"])
     prompt_builder = build_prompt_builder(meta.get("text_prompt"))
     _, val_eval_dl = make_loader(
