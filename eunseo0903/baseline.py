@@ -260,7 +260,12 @@ class Vocab:
     def __init__(self, min_freq: int = 1):
         self.min_freq = min_freq
         self.freq: Dict[str, int] = {}
-        self.itos: List[str] = ["<pad>", "<unk>"]
+        
+        # --- [★ 1. 핵심 수정: 특수 토큰을 초기 단어장에 추가] ---
+        # [DOC], [QUERY], [TYPE]을 <pad>, <unk>와 같이 고유 ID를 갖도록 추가합니다.
+        self.itos: List[str] = ["<pad>", "<unk>", "[DOC]", "[QUERY]", "[TYPE]"]
+        # --- [수정 완료] ---
+        
         self.stoi: Dict[str, int] = {tok: i for i, tok in enumerate(self.itos)}
 
     def build(self, texts: List[str]):
@@ -268,6 +273,7 @@ class Vocab:
             for tok in simple_tokenize(s):
                 self.freq[tok] = self.freq.get(tok, 0) + 1
         for tok, f in sorted(self.freq.items(), key=lambda x: (-x[1], x[0])):
+            # self.stoi에 이미 [DOC] 등이 있으므로, min_freq를 통과해도 중복 추가되지 않습니다.
             if f >= self.min_freq and tok not in self.stoi:
                 self.stoi[tok] = len(self.itos)
                 self.itos.append(tok)
@@ -276,6 +282,7 @@ class Vocab:
         toks = simple_tokenize(s)[:max_len]
         if not toks:
             return [1]  # ensure length>=1 with <unk>
+        # simple_tokenize는 "[DOC]"를 하나의 토큰으로 인식하므로 수정이 필요 없습니다.
         return [self.stoi.get(t, 1) for t in toks]
 
 
@@ -285,8 +292,6 @@ class UniDSet(Dataset):
                  supervised_only: bool = False):
         
         self.items: List[Dict[str, Any]] = []
-
-        # 이미지 리사이즈/감독 여부 및 캐시 파일 suffix 설정
         self.resize_to = resize_to
         self.supervised_only = supervised_only
         self.cache_suffix = f"_cache_{resize_to[0]}x{resize_to[1]}.pt"
@@ -296,20 +301,22 @@ class UniDSet(Dataset):
         )
 
         for jf in tqdm(json_files, desc=f"[data] {desc_name}", leave=False, dynamic_ncols=True):
-            # 0) 화이트리스트에 있는 JSON은 스킵
             jf_norm = os.path.normpath(jf)
-            if jf_norm in BAD_JSON_WHITELIST: # (BAD_JSON_WHITELIST는 어딘가에 정의되어 있어야 함)
+            if jf_norm in BAD_JSON_WHITELIST:
                 print(f"[bad-json] skipping whitelisted JSON: {jf}")
                 continue
 
-            # 1) JSON 읽기
             try:
                 data = read_json(jf)
             except ValueError as err:
-                # (handle_bad_json_exception는 어딘가에 정의되어 있어야 함)
                 if handle_bad_json_exception(jf, err):
                     continue
                 raise
+
+            # --- [★ 2. 핵심 수정: doc_type 추출] ---
+            # JSON 최상단의 doc_type 정보를 가져옵니다. (없으면 빈 문자열)
+            doc_type = data.get("raw_data_info", {}).get("doc_type", "") or ""
+            # --- [수정 완료] ---
 
             ann = data.get("learning_data_info", {}).get("annotation", [])
             img_path = get_image_path(jf, data, jpg_dir=jpg_dir)
@@ -320,18 +327,28 @@ class UniDSet(Dataset):
 
                 qid = a.get("instance_id", "")
                 
-                # --- [★ 1. 핵심 수정: 텍스트 합치기] ---
+                # --- [★ 3. 핵심 수정: 구조화된 쿼리 문자열 생성] ---
                 qtxt = str(a.get("visual_instruction", "")).strip()
                 cname = a.get("class_name", "") or ""
-                combined_query = f"{cname} {qtxt}".strip()
+
+                # [DOC] {doc_type} [QUERY] {query_text} [TYPE] {class_name} 형식으로 조합
+                parts = []
+                if doc_type:
+                    parts.append(f"[DOC] {doc_type.strip()}") # 혹시 모를 공백 제거
+                if qtxt:
+                    parts.append(f"[QUERY] {qtxt}")
+                if cname:
+                    parts.append(f"[TYPE] {cname.strip()}") # 혹시 모를 공백 제거
+                
+                # 정보가 하나라도 있을 때만 공백으로 join
+                combined_query = " ".join(parts)
                 # --- [수정 완료] ---
 
-                bbox = a.get("bounding_box", None)  # train/val에는 bbox, test는 없을 수 있음
+                bbox = a.get("bounding_box", None) 
 
                 if supervised_only and not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
                     continue
 
-                # 캐시 파일 경로: 원본 이미지와 동일 경로, 다른 확장자(.pt)
                 base, _ = os.path.splitext(img_path)
                 cache_path = base + self.cache_suffix
 
@@ -339,37 +356,35 @@ class UniDSet(Dataset):
                     "json": jf,
                     "img": img_path,
                     "query_id": qid,
-                    "query": combined_query,  # <-- 수정: 합쳐진 쿼리를 저장
+                    "query": combined_query,  # <-- 수정: 구조화된 쿼리를 저장
                     "bbox": bbox,
-                    "class_name": cname,      # <-- 원본 class_name도 메타데이터로 저장
+                    "class_name": cname,
                     "cache_path": cache_path,
                 })
 
-        # --- [★ 2. 핵심 수정: 논리적 순서 변경] ---
-        # self.items 리스트가 모두 채워진 *후에* vocab을 빌드해야 합니다.
+        # Vocab 빌드 로직은 수정할 필요 없습니다.
+        # self.items가 채워진 후에 build가 호출되며,
+        # self.items의 "query" 키에는 이미 구조화된 문자열이 들어있습니다.
         self.vocab = vocab if vocab is not None else Vocab(min_freq=1)
         if build_vocab:
-            # "query" 키에는 이미 합쳐진 텍스트가 들어있습니다.
             self.vocab.build([it["query"] for it in self.items])
-        # --- [수정 완료] ---
 
-        # 모든 아이템에 대해 pre-encoding 수행
+        # Pre-encoding 로직도 수정할 필요 없습니다.
         for it in self.items:
-            # it["query"]는 이미 합쳐진 텍스트이므로, 이 부분은 수정할 필요가 없습니다.
             it["encoded_query"] = self.vocab.encode(it["query"], max_len=40)
 
         if _BACKBONE_OK:
             from torchvision import transforms as T
             self.tf = T.Compose([T.Resize(resize_to), T.ToTensor()])
         else:
-            self.tf = None  # will manually convert
+            self.tf = None
 
+    # ... __len__ 및 __getitem__ 등 나머지 코드는 수정 불필요 ...
     def __len__(self):
         return len(self.items)
 
     @staticmethod
     def _pil_to_tensor(img: Image.Image) -> torch.Tensor:
-        # (중복된 함수 정의 제거)
         arr = np.array(img).astype(np.float32) / 255.0
         if arr.ndim == 2:
             arr = np.stack([arr, arr, arr], axis=-1)
@@ -377,25 +392,17 @@ class UniDSet(Dataset):
         return torch.from_numpy(arr)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        # --- [수정 불필요] ---
-        # 이 함수는 __init__에서 준비한 it["encoded_query"]와 it["query"]를
-        # 그대로 사용하므로, 수정할 필요가 전혀 없습니다.
-        # --- [수정 불필요] ---
+        # 이 함수는 __init__에서 미리 인코딩한 it["encoded_query"]를 사용하므로
+        # 전혀 수정할 필요가 없습니다.
         it = self.items[idx]
         cache_path = it.get("cache_path", None)
-
-        # =========================
-        # 1) 캐시에서 먼저 시도
-        # =========================
         img_t: Optional[torch.Tensor] = None
         W: int
         H: int
 
         if cache_path is not None and os.path.isfile(cache_path):
             try:
-                # NOTE: PyTorch 2.6 대비 weights_only=False 명시
                 cached = torch.load(cache_path, map_location="cpu", weights_only=False)
-                # {"image": Tensor, "orig_size": (W, H)} 포맷을 기대
                 if isinstance(cached, dict) and "image" in cached and "orig_size" in cached:
                     img_t = cached["image"]
                     W, H = cached["orig_size"]
@@ -405,31 +412,24 @@ class UniDSet(Dataset):
                 print(f"[cache] failed to load {cache_path}: {e}")
                 img_t = None
 
-        # ==========================================
-        # 2) 캐시가 없거나 실패하면 원본에서 생성
-        # ==========================================
         if img_t is None:
             img = Image.open(it["img"]).convert("RGB")
             W, H = img.size
 
             if self.tf is not None:
-                img_t = self.tf(img)  # Resize + ToTensor
+                img_t = self.tf(img)
             else:
                 img = img.resize(self.resize_to, Image.BILNEAR)
                 img_t = self._pil_to_tensor(img)
 
-            # 생성한 결과를 캐시에 저장
             if cache_path is not None and not os.path.exists(cache_path):
                 try:
                     torch.save({"image": img_t, "orig_size": (W, H)}, cache_path)
                 except Exception as e:
                     print(f"[cache] failed to save {cache_path}: {e}")
-
-        # =========================
-        # 3) 나머지 메타/타깃 구성
-        # =========================
+        
         ids = it["encoded_query"]
-        length = max(1, len(ids))  # safety: ensure >=1
+        length = max(1, len(ids))
 
         sample: Dict[str, Any] = {
             "image": img_t,
@@ -440,8 +440,7 @@ class UniDSet(Dataset):
             "orig_size": (W, H),
             "class_name": it["class_name"],
         }
-
-        # JSON bbox (x, y, w, h) in pixel → (cx, cy, w, h) normalized
+        
         if it["bbox"] is not None and isinstance(it["bbox"], (list, tuple)) and len(it["bbox"]) == 4:
             x, y, w, h = it["bbox"]
             cx = (x + w / 2.0) / W
