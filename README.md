@@ -19,5 +19,5 @@ pip install -r requirements.txt
 ```
 cd sanghyunna
 python baseline_final.py fit
-python baseline_final.py predict predict --ckpt ./outputs_baseline_best/ckpt/cross_attn_vlm_ep19.0.pth --out_csv ./outputs_baseline_best/preds/test_pred_ep19.csv
+python baseline_final.py predict --ckpt ./outputs_baseline_best/ckpt/cross_attn_vlm_ep19.0.pth --out_csv ./outputs_baseline_best/preds/test_pred_ep19.csv
 ```
