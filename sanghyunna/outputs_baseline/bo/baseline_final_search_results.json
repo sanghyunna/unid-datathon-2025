@@ -1,0 +1,189 @@
+{
+  "search_space": {
+    "dim": [
+      512,
+      1024
+    ],
+    "cross_attn_dim": [
+      512,
+      768,
+      1024
+    ],
+    "cross_attn_layers": [
+      1,
+      2,
+      4
+    ],
+    "cross_attn_heads": [
+      1,
+      2,
+      4,
+      8
+    ]
+  },
+  "config": {
+    "iterations": 10,
+    "init_random": 3,
+    "ei_exploration": 0.01,
+    "batch_size": 64,
+    "img_size": 512,
+    "lr": 0.0001,
+    "weight_decay": 0.0001,
+    "num_workers": 8,
+    "no_pretrain": false,
+    "seed": 42,
+    "device": "cuda",
+    "results_path": "./outputs_baseline/bo/baseline_final_search_results.json",
+    "train_root": "../data/train_valid/train",
+    "train_json_dir": null,
+    "train_jpg_dir": null,
+    "val_root": "../data/train_valid/valid",
+    "val_json_dir": null,
+    "val_jpg_dir": null
+  },
+  "results": [
+    {
+      "iteration": 1,
+      "params": {
+        "dim": 512,
+        "cross_attn_dim": 768,
+        "cross_attn_layers": 1,
+        "cross_attn_heads": 4
+      },
+      "val_miou": 0.4061902730587471,
+      "train_miou": 0.3492633105969934,
+      "train_loss": 0.004944076853332169,
+      "elapsed_sec": 286.49973797798157
+    },
+    {
+      "iteration": 2,
+      "params": {
+        "dim": 512,
+        "cross_attn_dim": 512,
+        "cross_attn_layers": 1,
+        "cross_attn_heads": 8
+      },
+      "val_miou": 0.40694891200124667,
+      "train_miou": 0.35425218530165953,
+      "train_loss": 0.00489830009883943,
+      "elapsed_sec": 278.39777541160583
+    },
+    {
+      "iteration": 3,
+      "params": {
+        "dim": 1024,
+        "cross_attn_dim": 512,
+        "cross_attn_layers": 1,
+        "cross_attn_heads": 2
+      },
+      "val_miou": 0.4368932887217794,
+      "train_miou": 0.34670496565533465,
+      "train_loss": 0.004984743073487113,
+      "elapsed_sec": 282.87095832824707
+    },
+    {
+      "iteration": 4,
+      "params": {
+        "dim": 1024,
+        "cross_attn_dim": 512,
+        "cross_attn_layers": 4,
+        "cross_attn_heads": 2
+      },
+      "val_miou": 0.41843741779663535,
+      "train_miou": 0.3534317158048275,
+      "train_loss": 0.004962825682034541,
+      "elapsed_sec": 289.1573905944824
+    },
+    {
+      "iteration": 5,
+      "params": {
+        "dim": 1024,
+        "cross_attn_dim": 1024,
+        "cross_attn_layers": 2,
+        "cross_attn_heads": 8
+      },
+      "val_miou": 0.41046294188901833,
+      "train_miou": 0.34940491983752614,
+      "train_loss": 0.00498774243166816,
+      "elapsed_sec": 287.1609835624695
+    },
+    {
+      "iteration": 6,
+      "params": {
+        "dim": 512,
+        "cross_attn_dim": 512,
+        "cross_attn_layers": 2,
+        "cross_attn_heads": 1
+      },
+      "val_miou": 0.4245700082404453,
+      "train_miou": 0.3510790991994729,
+      "train_loss": 0.004894615692608323,
+      "elapsed_sec": 279.61360263824463
+    },
+    {
+      "iteration": 7,
+      "params": {
+        "dim": 1024,
+        "cross_attn_dim": 512,
+        "cross_attn_layers": 1,
+        "cross_attn_heads": 4
+      },
+      "val_miou": 0.41037524616376053,
+      "train_miou": 0.3450964083958817,
+      "train_loss": 0.005042483066696383,
+      "elapsed_sec": 282.57774472236633
+    },
+    {
+      "iteration": 8,
+      "params": {
+        "dim": 1024,
+        "cross_attn_dim": 512,
+        "cross_attn_layers": 2,
+        "cross_attn_heads": 2
+      },
+      "val_miou": 0.41638493100042645,
+      "train_miou": 0.3508458265805319,
+      "train_loss": 0.004986688451960854,
+      "elapsed_sec": 284.7584402561188
+    },
+    {
+      "iteration": 9,
+      "params": {
+        "dim": 512,
+        "cross_attn_dim": 512,
+        "cross_attn_layers": 1,
+        "cross_attn_heads": 1
+      },
+      "val_miou": 0.43045734805315455,
+      "train_miou": 0.35632861934383186,
+      "train_loss": 0.004872342319782737,
+      "elapsed_sec": 278.26626777648926
+    },
+    {
+      "iteration": 10,
+      "params": {
+        "dim": 512,
+        "cross_attn_dim": 512,
+        "cross_attn_layers": 1,
+        "cross_attn_heads": 2
+      },
+      "val_miou": 0.4088450255559937,
+      "train_miou": 0.34175096252889103,
+      "train_loss": 0.004984311420062514,
+      "elapsed_sec": 278.23405408859253
+    }
+  ],
+  "best": {
+    "iteration": 3,
+    "params": {
+      "dim": 1024,
+      "cross_attn_dim": 512,
+      "cross_attn_layers": 1,
+      "cross_attn_heads": 2
+    },
+    "val_miou": 0.4368932887217794,
+    "train_miou": 0.34670496565533465,
+    "train_loss": 0.004984743073487113,
+    "elapsed_sec": 282.87095832824707
+  }
+}

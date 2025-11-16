@@ -1,6 +1,7 @@
 torch>=2.0
 torchvision>=0.15
 transformers>=4.40
+peft>=0.7.0
 doclayout-yolo>=0.1.0
 huggingface-hub>=0.21
 pandas>=2.0

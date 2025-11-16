@@ -30,7 +30,7 @@ except Exception:
 class CFG:
     # Core
     IMG_SIZE: int = 512
-    EPOCHS: int = 30
+    EPOCHS: int = 20
     LEARNING_RATE: float = 1e-4
     BATCH_SIZE: int = 64
     SEED: int = 42
@@ -42,12 +42,12 @@ class CFG:
     CROSS_ATTN_HEADS: int = 1
 
     # Paths (override by CLI if desired)
-    CKPT_PATH: str = "./outputs_baseline_best/ckpt/cross_attn_vlm.pth"
-    RESUME_CKPT_PATH: str = None
-    # RESUME_CKPT_PATH: str = "./outputs_baseline_best/ckpt/cross_attn_vlm_ep10.0.pth"
-    EVAL_CSV: str = "./outputs_baseline_best/preds/eval_pred.csv"
-    PRED_CSV: str = "./outputs_baseline_best/preds/test_pred.csv"
-    SUBMISSION_ZIP: str = "./outputs_baseline_best/submission.zip"
+    CKPT_PATH: str = "./outputs_baseline_best_sec/ckpt/cross_attn_vlm.pth"
+    # Default resume checkpoint for `fit`; points to a known-good baseline checkpoint
+    RESUME_CKPT_PATH: str = "./outputs_baseline_best/ckpt/cross_attn_vlm_ep10.0.pth"
+    EVAL_CSV: str = "./outputs_baseline_best_sec/preds/eval_pred.csv"
+    PRED_CSV: str = "./outputs_baseline_best_sec/preds/test_pred.csv"
+    SUBMISSION_ZIP: str = "./outputs_baseline_best_sec/submission.zip"
 
     # Optional split-specific overrides
     TRAIN_ROOT: Optional[str] = "../data/train_valid/train"

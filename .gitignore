@@ -8,3 +8,5 @@ __pycache__/
 /flash-attention
 *.pth
 *.csv
+.hf_cache/
+*.pt
